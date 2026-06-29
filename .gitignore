@@ -1,0 +1,13 @@
+.DS_Store
+.playwright-mcp/
+.build/
+.swiftpm/
+dist/
+releases/
+DerivedData/
+*.xcuserdata/
+*.xcuserstate
+*.xcodeproj/project.xcworkspace/xcuserdata/
+*.xcodeproj/xcuserdata/
+*.dSYM/
+*.app/
