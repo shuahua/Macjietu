@@ -1,5 +1,22 @@
 import Foundation
 
+enum ScreenshotExportScale: Double, CaseIterable {
+    case original = 1, double = 2, triple = 3
+
+    var title: String {
+        switch self {
+        case .original: "原始像素（推荐）"
+        case .double: "2 倍像素（插值放大）"
+        case .triple: "3 倍像素（插值放大）"
+        }
+    }
+
+    static func normalized(_ value: Double) -> Double {
+        guard value.isFinite, value >= 1 else { return 1 }
+        return min(3, value.rounded())
+    }
+}
+
 struct AppSettings: Codable, Equatable {
     var captureShortcut: Shortcut
     var autoCopyAfterCapture: Bool
@@ -12,7 +29,7 @@ struct AppSettings: Codable, Equatable {
         autoCopyAfterCapture: false,
         launchAtLogin: false,
         saveDirectory: nil,
-        exportScale: 2
+        exportScale: 1
     )
 
     init(captureShortcut: Shortcut, autoCopyAfterCapture: Bool, launchAtLogin: Bool, saveDirectory: URL?, exportScale: Double) {
@@ -20,7 +37,7 @@ struct AppSettings: Codable, Equatable {
         self.autoCopyAfterCapture = autoCopyAfterCapture
         self.launchAtLogin = launchAtLogin
         self.saveDirectory = saveDirectory
-        self.exportScale = exportScale
+        self.exportScale = ScreenshotExportScale.normalized(exportScale)
     }
 
     init(from decoder: Decoder) throws {
@@ -29,7 +46,9 @@ struct AppSettings: Codable, Equatable {
         autoCopyAfterCapture = try container.decode(Bool.self, forKey: .autoCopyAfterCapture)
         launchAtLogin = try container.decodeIfPresent(Bool.self, forKey: .launchAtLogin) ?? Self.defaults.launchAtLogin
         saveDirectory = try container.decodeIfPresent(URL.self, forKey: .saveDirectory)
-        exportScale = try container.decodeIfPresent(Double.self, forKey: .exportScale) ?? Self.defaults.exportScale
+        // 保留旧 1/2/3 的选择，已移除的 4/5 收敛到 3；缺失字段推荐原始。
+        exportScale = ScreenshotExportScale.normalized(
+            try container.decodeIfPresent(Double.self, forKey: .exportScale) ?? Self.defaults.exportScale)
     }
 }
 

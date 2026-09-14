@@ -3,6 +3,7 @@ import AppKit
 enum AnnotationTool: String {
     case none = ""
     case pen = "画笔"
+    case text = "文字"
     case eraser = "橡皮"
     case rectangle = "矩形"
     case oval = "圆形"
@@ -13,6 +14,7 @@ enum AnnotationTool: String {
 
 enum AnnotationShape {
     case pen([CGPoint], NSColor, CGFloat)
+    case text(String, CGPoint, NSColor, CGFloat, String, TextWeight, Bool)
     case rectangle(CGRect, NSColor, CGFloat)
     case oval(CGRect, NSColor, CGFloat)
     case line(CGPoint, CGPoint, NSColor, CGFloat)
@@ -20,8 +22,25 @@ enum AnnotationShape {
     case mosaic(CGRect)
 }
 
+enum TextWeight: Int {
+    case regular
+    case medium
+    case semibold
+    case bold
+
+    var fontWeight: NSFont.Weight {
+        switch self {
+        case .regular: return .regular
+        case .medium: return .medium
+        case .semibold: return .semibold
+        case .bold: return .bold
+        }
+    }
+}
+
 private final class AnnotationEditorWindow: NSWindow {
     var onEscape: (() -> Void)?
+    override var canBecomeKey: Bool { true }
 
     override func keyDown(with event: NSEvent) {
         if event.keyCode == 53 {
@@ -38,7 +57,7 @@ private final class AnnotationEditorWindow: NSWindow {
 
 @MainActor
 final class AnnotationEditorController: NSObject {
-    private let minimumToolbarWidth: CGFloat = 480
+    private let minimumToolbarWidth: CGFloat = 560
     private let horizontalPadding: CGFloat = 20
     private let verticalPadding: CGFloat = 16
     private let topSafePadding: CGFloat = 36
@@ -57,6 +76,7 @@ final class AnnotationEditorController: NSObject {
     private var canvasView: AnnotationCanvasView?
     private var scrollView: NSScrollView?
     private var toolbarView: NSVisualEffectView?
+    private var optionsWindow: NSPanel?
     private var resizeHandleView: ResizeHandleView?
     private var baseCanvasSize: CGSize = .zero
     private var toolControl: NSSegmentedControl?
@@ -67,6 +87,10 @@ final class AnnotationEditorController: NSObject {
     private var strokeValueLabel: NSTextField?
     private var colorWells: [NSButton] = []
     private var customColorButton: NSButton?
+    private var ownsColorPanel = false
+    private var textFontName = "Helvetica Neue"
+    private var textWeight: TextWeight = .semibold
+    private var textUnderline = false
     private var zoomSlider: NSSlider?
     private var zoomValueLabel: NSTextField?
     private var zoomScale: CGFloat = 1
@@ -93,7 +117,7 @@ final class AnnotationEditorController: NSObject {
         let horizontalPadding: CGFloat = 20
         let verticalPadding: CGFloat = 16
         let topSafePadding: CGFloat = 36
-        let toolbarHeight: CGFloat = 138
+        let toolbarHeight: CGFloat = 62
         let screenFrame = NSScreen.main?.visibleFrame ?? CGRect(x: 0, y: 0, width: 1440, height: 900)
         let canvasSize = longScreenshotCanvasSize(for: image.size, screenFrame: screenFrame, horizontalPadding: horizontalPadding)
         baseCanvasSize = canvasSize
@@ -139,15 +163,16 @@ final class AnnotationEditorController: NSObject {
         let rect = CGRect(x: screenFrame.midX - contentSize.width / 2, y: screenFrame.midY - contentSize.height / 2, width: contentSize.width, height: contentSize.height)
         let window = makeEditorWindow(rect: rect, contentView: contentView)
         self.window = window
-        window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+        window.makeKey()
     }
 
     private func showStandardEditor() {
         let horizontalPadding: CGFloat = 20
         let verticalPadding: CGFloat = 16
         let topSafePadding: CGFloat = 36
-        let toolbarHeight: CGFloat = 138
+        let toolbarHeight: CGFloat = 62
         let screenFrame = NSScreen.main?.visibleFrame ?? CGRect(x: 0, y: 0, width: 1440, height: 900)
         let canvasSize = canvasSize(for: image.size, screenFrame: screenFrame, toolbarHeight: toolbarHeight, horizontalPadding: horizontalPadding, verticalPadding: verticalPadding)
         baseCanvasSize = canvasSize
@@ -178,13 +203,18 @@ final class AnnotationEditorController: NSObject {
         let rect = CGRect(x: screenFrame.midX - contentSize.width / 2, y: screenFrame.midY - contentSize.height / 2, width: contentSize.width, height: contentSize.height)
         let window = makeEditorWindow(rect: rect, contentView: contentView)
         self.window = window
-        window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+        window.makeKey()
     }
 
     private func makeEditorWindow(rect: CGRect, contentView: NSView) -> AnnotationEditorWindow {
-        let window = AnnotationEditorWindow(contentRect: rect, styleMask: [.titled, .fullSizeContentView], backing: .buffered, defer: false)
-        window.onEscape = { [weak self] in self?.closeWindow() }
+        let window = AnnotationEditorWindow(contentRect: rect, styleMask: [.borderless], backing: .buffered, defer: false)
+        window.onEscape = { [weak self] in
+            guard let self else { return }
+            if self.canvasView?.commitTextEditing() == true { return }
+            self.closeWindow()
+        }
         window.title = "截图编辑"
         window.isReleasedWhenClosed = false
         window.titleVisibility = .hidden
@@ -200,54 +230,69 @@ final class AnnotationEditorController: NSObject {
     @objc private func selectPen() {
         deactivateShapeTool()
         canvasView?.tool = .pen
+        showPenOptions()
+    }
+
+    @objc private func selectText() {
+        deactivateShapeTool()
+        canvasView?.tool = .text
+        canvasView?.onTextSelectionChanged = { [weak self] in
+            guard let self, let canvas = self.canvasView else { return }
+            self.textFontName = canvas.textFontName
+            self.textWeight = canvas.textWeight
+            self.textUnderline = canvas.textUnderline
+            self.showTextOptions()
+        }
+        showTextOptions()
     }
 
     @objc private func selectEraser() {
         deactivateShapeTool()
         canvasView?.tool = .eraser
+        closeOptionsWindow()
     }
 
     @objc private func selectRectangle() {
-        selectedShapeTool = .rectangle
-        isShapeToolActive = true
-        toolControl?.selectedSegment = -1
-        canvasView?.tool = .rectangle
-        updateShapePopup(selectedIndex: 0)
+        selectShape(.rectangle, index: 0)
     }
 
     @objc private func selectOval() {
-        selectedShapeTool = .oval
-        isShapeToolActive = true
-        toolControl?.selectedSegment = -1
-        canvasView?.tool = .oval
-        updateShapePopup(selectedIndex: 1)
+        selectShape(.oval, index: 1)
     }
 
     @objc private func selectLine() {
-        selectedShapeTool = .line
-        isShapeToolActive = true
-        toolControl?.selectedSegment = -1
-        canvasView?.tool = .line
-        updateShapePopup(selectedIndex: 2)
+        selectShape(.line, index: 2)
     }
 
     @objc private func selectArrow() {
-        selectedShapeTool = .arrow
+        selectShape(.arrow, index: 3)
+    }
+
+    private func selectShape(_ tool: AnnotationTool, index: Int) {
+        if isShapeToolActive && canvasView?.tool == tool {
+            deactivateShapeTool()
+            closeOptionsWindow()
+            return
+        }
+        selectedShapeTool = tool
         isShapeToolActive = true
         toolControl?.selectedSegment = -1
-        canvasView?.tool = .arrow
-        updateShapePopup(selectedIndex: 3)
+        canvasView?.tool = tool
+        showPenOptions()
+        updateShapePopup(selectedIndex: index)
     }
 
     @objc private func selectMosaic() {
         deactivateShapeTool()
         canvasView?.tool = .mosaic
+        closeOptionsWindow()
     }
 
     @objc private func toolChanged(_ sender: NSSegmentedControl) {
         if canvasView?.tool == tool(for: sender.selectedSegment) {
             canvasView?.tool = .none
             deactivateShapeTool()
+            closeOptionsWindow()
             sender.selectedSegment = -1
             return
         }
@@ -255,10 +300,14 @@ final class AnnotationEditorController: NSObject {
         switch sender.selectedSegment {
         case -1:
             canvasView?.tool = .none
+            deactivateShapeTool()
+            closeOptionsWindow()
         case 1:
             selectEraser()
         case 2:
             selectMosaic()
+        case 3:
+            selectText()
         default:
             selectPen()
         }
@@ -269,6 +318,7 @@ final class AnnotationEditorController: NSObject {
         case 0: return .pen
         case 1: return .eraser
         case 2: return .mosaic
+        case 3: return .text
         default: return .none
         }
     }
@@ -277,6 +327,7 @@ final class AnnotationEditorController: NSObject {
         let selectedTool = shapeTool(for: sender.indexOfSelectedItem)
         if isShapeToolActive && selectedTool == selectedShapeTool {
             deactivateShapeTool()
+            closeOptionsWindow()
             return
         }
 
@@ -325,6 +376,11 @@ final class AnnotationEditorController: NSObject {
 
     @objc private func strokeSliderChanged(_ sender: NSSlider) {
         let width = CGFloat(sender.doubleValue)
+        if sender.tag == 1 {
+            canvasView?.textPointSize = width
+            strokeValueLabel?.stringValue = "\(Int(width.rounded())) pt"
+            return
+        }
         canvasView?.strokeWidth = width
         strokeValueLabel?.stringValue = "\(Int(width.rounded())) px"
     }
@@ -351,6 +407,7 @@ final class AnnotationEditorController: NSObject {
     }
 
     @objc private func showColorPanel() {
+        ownsColorPanel = true
         let panel = NSColorPanel.shared
         panel.setTarget(self)
         panel.setAction(#selector(customColorChanged(_:)))
@@ -370,7 +427,170 @@ final class AnnotationEditorController: NSObject {
         }
     }
 
+    @objc private func textFontChanged(_ sender: NSPopUpButton) {
+        textFontName = sender.titleOfSelectedItem ?? textFontName
+        canvasView?.textFontName = textFontName
+    }
+
+    @objc private func textWeightChanged(_ sender: NSPopUpButton) {
+        textWeight = TextWeight(rawValue: sender.indexOfSelectedItem) ?? .semibold
+        canvasView?.textWeight = textWeight
+    }
+
+    @objc private func textUnderlineChanged(_ sender: NSButton) {
+        textUnderline = sender.state == .on
+        canvasView?.textUnderline = textUnderline
+    }
+
+    private func showPenOptions() {
+        showOptionsWindow(size: CGSize(width: 336, height: 86)) { [weak self] contentView in
+            guard let self else { return }
+            self.addStrokeControls(to: contentView, y: 48)
+            self.addColorControls(to: contentView, y: 14)
+        }
+    }
+
+    private func showTextOptions() {
+        canvasView?.textFontName = textFontName
+        canvasView?.textWeight = textWeight
+        canvasView?.textUnderline = textUnderline
+        showOptionsWindow(size: CGSize(width: 420, height: 126)) { [weak self] contentView in
+            guard let self else { return }
+            let label = self.addOptionLabel("字体", x: 16, y: 92, width: 36, to: contentView)
+            let fontPopup = NSPopUpButton(frame: CGRect(x: label.frame.maxX + 8, y: 87, width: 154, height: 28), pullsDown: false)
+            let fontNames = ["Helvetica Neue", "PingFang SC", "Songti SC", "Kaiti SC", "Menlo", "Arial"]
+            fontNames.forEach { fontPopup.addItem(withTitle: $0) }
+            if let index = fontNames.firstIndex(of: self.textFontName) { fontPopup.selectItem(at: index) }
+            fontPopup.target = self
+            fontPopup.action = #selector(self.textFontChanged(_:))
+            contentView.addSubview(fontPopup)
+
+            let weightPopup = NSPopUpButton(frame: CGRect(x: fontPopup.frame.maxX + 10, y: 87, width: 92, height: 28), pullsDown: false)
+            ["常规", "中等", "半粗", "粗体"].forEach { weightPopup.addItem(withTitle: $0) }
+            weightPopup.selectItem(at: self.textWeight.rawValue)
+            weightPopup.target = self
+            weightPopup.action = #selector(self.textWeightChanged(_:))
+            contentView.addSubview(weightPopup)
+
+            let underline = NSButton(checkboxWithTitle: "下划线", target: self, action: #selector(self.textUnderlineChanged(_:)))
+            underline.frame = CGRect(x: weightPopup.frame.maxX + 10, y: 90, width: 74, height: 22)
+            underline.state = self.textUnderline ? .on : .off
+            contentView.addSubview(underline)
+
+            self.addStrokeControls(to: contentView, y: 52, label: "字号")
+            self.addColorControls(to: contentView, y: 16)
+        }
+    }
+
+    private func showOptionsWindow(size: CGSize, build: (NSView) -> Void) {
+        closeOptionsWindow()
+        guard let window else { return }
+        let panel = Self.makeOptionsPanel(size: size)
+        guard let contentView = panel.contentView?.subviews.first as? NSVisualEffectView else { return }
+        build(contentView)
+        let frame = window.frame
+        let visible = window.screen?.visibleFrame ?? frame
+        let preferredY = frame.minY - size.height - 10
+        let y = preferredY >= visible.minY ? preferredY : frame.maxY + 10
+        panel.setFrameOrigin(CGPoint(
+            x: max(visible.minX, min(frame.midX - size.width / 2, visible.maxX - size.width)),
+            y: max(visible.minY, min(y, visible.maxY - size.height))
+        ))
+        window.addChildWindow(panel, ordered: .above)
+        panel.orderFront(nil)
+        optionsWindow = panel
+    }
+
+    static func makeOptionsPanel(size: CGSize) -> NSPanel {
+        let bounds = CGRect(origin: .zero, size: size)
+        let panel = NSPanel(contentRect: bounds, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        panel.backgroundColor = .clear
+        panel.isOpaque = false
+        panel.hasShadow = true
+        panel.level = .floating
+        panel.isReleasedWhenClosed = false
+        panel.hidesOnDeactivate = false
+
+        // 独立透明容器裁剪整个效果层及控件；仅设置 cornerRadius 不会裁剪子层。
+        let clipView = NSView(frame: bounds)
+        clipView.wantsLayer = true
+        clipView.layer?.backgroundColor = NSColor.clear.cgColor
+        clipView.layer?.cornerRadius = 14
+        clipView.layer?.masksToBounds = true
+        clipView.layer?.borderWidth = 0
+        clipView.layer?.borderColor = nil
+        let effect = NSVisualEffectView(frame: bounds)
+        effect.autoresizingMask = [.width, .height]
+        effect.material = .popover
+        // 独立透明浮窗应采样窗后背景，而不是空的窗内背景。
+        effect.blendingMode = .behindWindow
+        effect.state = .active
+        effect.wantsLayer = true
+        effect.layer?.cornerRadius = 14
+        effect.layer?.masksToBounds = true
+        effect.layer?.borderWidth = 0
+        effect.layer?.borderColor = nil
+        clipView.addSubview(effect)
+        panel.contentView = clipView
+        return panel
+    }
+
+    private func closeOptionsWindow() {
+        if ownsColorPanel {
+            NSColorPanel.shared.orderOut(nil)
+            NSColorPanel.shared.setTarget(nil)
+            NSColorPanel.shared.setAction(nil)
+            ownsColorPanel = false
+        }
+        if let optionsWindow {
+            optionsWindow.parent?.removeChildWindow(optionsWindow)
+        }
+        optionsWindow?.orderOut(nil)
+        optionsWindow?.contentView = nil
+        optionsWindow = nil
+        strokeSlider = nil
+        strokeValueLabel = nil
+        colorWells.removeAll()
+        customColorButton = nil
+    }
+
+    private func addStrokeControls(to contentView: NSView, y: CGFloat, label: String = "粗细") {
+        let strokeLabel = addOptionLabel(label, x: 16, y: y + 5, width: 36, to: contentView)
+        let isText = label == "字号"
+        let value = isText ? (canvasView?.textPointSize ?? 20) : (canvasView?.strokeWidth ?? 4)
+        let slider = NSSlider(value: Double(value), minValue: isText ? 12 : 1, maxValue: isText ? 80 : 16, target: self, action: #selector(strokeSliderChanged(_:)))
+        slider.tag = isText ? 1 : 0
+        slider.frame = CGRect(x: strokeLabel.frame.maxX + 8, y: y + 3, width: 190, height: 22)
+        slider.numberOfTickMarks = 4
+        slider.allowsTickMarkValuesOnly = false
+        contentView.addSubview(slider)
+        strokeSlider = slider
+
+        let valueLabel = NSTextField(labelWithString: "\(Int(value.rounded())) \(isText ? "pt" : "px")")
+        valueLabel.frame = CGRect(x: slider.frame.maxX + 6, y: y + 5, width: 44, height: 18)
+        valueLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .medium)
+        valueLabel.textColor = NSColor.labelColor.withAlphaComponent(0.82)
+        contentView.addSubview(valueLabel)
+        strokeValueLabel = valueLabel
+    }
+
+    private func addColorControls(to contentView: NSView, y: CGFloat) {
+        let colorLabel = addOptionLabel("颜色", x: 16, y: y + 5, width: 36, to: contentView)
+        addColorWells(to: contentView, origin: CGPoint(x: colorLabel.frame.maxX + 8, y: y + 2))
+    }
+
+    @discardableResult
+    private func addOptionLabel(_ title: String, x: CGFloat, y: CGFloat, width: CGFloat, to contentView: NSView) -> NSTextField {
+        let label = NSTextField(labelWithString: title)
+        label.frame = CGRect(x: x, y: y, width: width, height: 18)
+        label.font = .systemFont(ofSize: 11, weight: .medium)
+        label.textColor = NSColor.labelColor.withAlphaComponent(0.82)
+        contentView.addSubview(label)
+        return label
+    }
+
     @objc private func finishEditing() {
+        canvasView?.commitTextEditing()
         guard let image = canvasView?.renderedImage(scale: exportScale) else { return }
         let completion = onComplete
         closeWithoutCallback()
@@ -382,11 +602,13 @@ final class AnnotationEditorController: NSObject {
     }
 
     @objc private func copyImage() {
+        canvasView?.commitTextEditing()
         guard let image = canvasView?.renderedImage(scale: exportScale) else { return }
         onCopy?(image)
     }
 
     @objc private func saveImage() {
+        canvasView?.commitTextEditing()
         guard let image = canvasView?.renderedImage(scale: exportScale) else { return }
         guard onSave?(image) == true else { return }
         let completion = onComplete
@@ -395,12 +617,14 @@ final class AnnotationEditorController: NSObject {
     }
 
     @objc private func pinImage() {
+        canvasView?.commitTextEditing()
         guard let image = canvasView?.renderedImage(scale: exportScale) else { return }
         onPin?(image)
     }
 
     func exportImage() -> NSImage? {
-        canvasView?.renderedImage(scale: exportScale)
+        canvasView?.commitTextEditing()
+        return canvasView?.renderedImage(scale: exportScale)
     }
 
     @objc private func closeWindow() {
@@ -419,6 +643,7 @@ final class AnnotationEditorController: NSObject {
 
     private func tearDownViews() {
         canvasView?.dispose()
+        closeOptionsWindow()
         resizeHandleView?.onResize = nil
         window?.orderOut(nil)
         window?.contentView = nil
@@ -461,24 +686,24 @@ final class AnnotationEditorController: NSObject {
         toolbarView = toolbar
 
         let leftInset: CGFloat = 16
-        let topRowY = toolbarSize.height - 42
-        let strokeRowY = topRowY - 40
-        let colorRowY = strokeRowY - 36
+        let topRowY = toolbarSize.height - 46
         let toolControl = NSSegmentedControl(images: [
             systemImage("pencil.tip"),
             systemImage("eraser"),
-            systemImage("checkerboard.rectangle")
+            systemImage("checkerboard.rectangle"),
+            systemImage("textformat")
         ], trackingMode: .selectOne, target: self, action: #selector(toolChanged(_:)))
-        toolControl.frame = CGRect(x: leftInset, y: topRowY, width: 132, height: 30)
+        toolControl.frame = CGRect(x: leftInset, y: topRowY, width: 174, height: 30)
         toolControl.segmentStyle = .separated
         toolControl.selectedSegment = -1
         toolControl.setToolTip("画笔", forSegment: 0)
         toolControl.setToolTip("橡皮", forSegment: 1)
         toolControl.setToolTip("马赛克", forSegment: 2)
+        toolControl.setToolTip("文字", forSegment: 3)
         toolbar.addSubview(toolControl)
         self.toolControl = toolControl
 
-        let shapePopup = NSPopUpButton(frame: CGRect(x: toolControl.frame.maxX + 8, y: topRowY, width: 104, height: 30), pullsDown: false)
+        let shapePopup = NSPopUpButton(frame: CGRect(x: toolControl.frame.maxX + 8, y: topRowY, width: 96, height: 30), pullsDown: false)
         shapePopup.addItem(withTitle: "矩形")
         shapePopup.addItem(withTitle: "圆形")
         shapePopup.addItem(withTitle: "直线")
@@ -504,36 +729,8 @@ final class AnnotationEditorController: NSObject {
         addIconButton(symbolName: "pin", tooltip: "贴图", x: actionStartX + 76, y: topRowY, action: #selector(pinImage), to: toolbar)
         addIconButton(symbolName: "xmark", tooltip: "关闭", x: actionStartX + 114, y: topRowY, action: #selector(closeWindow), to: toolbar, isDestructive: true)
 
-        let strokeLabel = NSTextField(labelWithString: "粗细")
-        strokeLabel.frame = CGRect(x: leftInset, y: strokeRowY + 6, width: 32, height: 18)
-        strokeLabel.font = .systemFont(ofSize: 11, weight: .medium)
-        strokeLabel.textColor = NSColor.labelColor.withAlphaComponent(0.82)
-        toolbar.addSubview(strokeLabel)
-
-        let slider = NSSlider(value: 4, minValue: 1, maxValue: 16, target: self, action: #selector(strokeSliderChanged(_:)))
-        let sliderWidth: CGFloat = 190
-        slider.frame = CGRect(x: strokeLabel.frame.maxX + 8, y: strokeRowY + 4, width: sliderWidth, height: 22)
-        slider.numberOfTickMarks = 4
-        slider.allowsTickMarkValuesOnly = false
-        toolbar.addSubview(slider)
-        strokeSlider = slider
-
-        let valueLabel = NSTextField(labelWithString: "4 px")
-        valueLabel.frame = CGRect(x: slider.frame.maxX + 6, y: strokeRowY + 6, width: 38, height: 18)
-        valueLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .medium)
-        valueLabel.textColor = NSColor.labelColor.withAlphaComponent(0.82)
-        toolbar.addSubview(valueLabel)
-        strokeValueLabel = valueLabel
-
-        let colorLabel = NSTextField(labelWithString: "颜色")
-        colorLabel.frame = CGRect(x: leftInset, y: colorRowY + 6, width: 32, height: 18)
-        colorLabel.font = .systemFont(ofSize: 11, weight: .medium)
-        colorLabel.textColor = NSColor.labelColor.withAlphaComponent(0.82)
-        toolbar.addSubview(colorLabel)
-        addColorWells(to: toolbar, origin: CGPoint(x: colorLabel.frame.maxX + 8, y: colorRowY + 3))
-
         guard showsZoomControls else { return }
-        let zoomRowY = colorRowY - 40
+        let zoomRowY = topRowY - 40
         let zoomLabel = NSTextField(labelWithString: "缩放")
         zoomLabel.frame = CGRect(x: leftInset, y: zoomRowY + 6, width: 32, height: 18)
         zoomLabel.font = .systemFont(ofSize: 11, weight: .medium)
@@ -560,7 +757,7 @@ final class AnnotationEditorController: NSObject {
         let horizontalPadding: CGFloat = 20
         let verticalPadding: CGFloat = 16
         let topSafePadding: CGFloat = 36
-        let toolbarHeight: CGFloat = showsZoomControls ? 178 : 138
+        let toolbarHeight: CGFloat = showsZoomControls ? 102 : 62
         let screenFrame = NSScreen.main?.visibleFrame ?? CGRect(x: 0, y: 0, width: 1440, height: 900)
         let scaledSize = CGSize(width: baseCanvasSize.width * zoomScale, height: baseCanvasSize.height * zoomScale)
         canvasView.setCanvasDisplaySize(scaledSize)
@@ -616,12 +813,13 @@ final class AnnotationEditorController: NSObject {
             button.target = self
             button.action = #selector(colorSelected(_:))
             button.tag = index
-            button.state = index == 0 ? .on : .off
+            let selected = canvasView?.strokeColor.isEqual(color) == true
+            button.state = selected ? .on : .off
             button.wantsLayer = true
             button.layer?.cornerRadius = 12
             button.layer?.backgroundColor = color.cgColor
-            button.layer?.borderWidth = index == 0 ? 3 : 1
-            button.layer?.borderColor = NSColor.white.withAlphaComponent(index == 0 ? 0.95 : 0.35).cgColor
+            button.layer?.borderWidth = selected ? 3 : 1
+            button.layer?.borderColor = NSColor.white.withAlphaComponent(selected ? 0.95 : 0.35).cgColor
             toolbar.addSubview(button)
             return button
         }
@@ -744,14 +942,49 @@ private final class ResizeHandleView: NSView {
     }
 }
 
-final class AnnotationCanvasView: NSView {
-    var tool: AnnotationTool = .none
-    var strokeColor: NSColor = .systemRed
+private final class CanvasTextView: NSTextView {
+    var onEscape: (() -> Void)?
+    private var movingText = false
+    private weak var dragCanvas: NSView?
+    override func mouseDown(with event: NSEvent) {
+        movingText = event.modifierFlags.contains(.option)
+        if movingText { dragCanvas = superview; dragCanvas?.mouseDown(with: event) } else { super.mouseDown(with: event) }
+    }
+    override func mouseDragged(with event: NSEvent) {
+        if movingText { dragCanvas?.mouseDragged(with: event) } else { super.mouseDragged(with: event) }
+    }
+    override func mouseUp(with event: NSEvent) {
+        if movingText { dragCanvas?.mouseUp(with: event); movingText = false; dragCanvas = nil } else { super.mouseUp(with: event) }
+    }
+    override func cancelOperation(_ sender: Any?) {
+        if hasMarkedText() { super.cancelOperation(sender) } else { onEscape?() }
+    }
+    override func keyDown(with event: NSEvent) {
+        if event.keyCode == 53, !hasMarkedText() { onEscape?(); return }
+        super.keyDown(with: event)
+    }
+}
+
+final class AnnotationCanvasView: NSView, NSTextViewDelegate {
+    var tool: AnnotationTool = .none {
+        willSet { if tool == .text && newValue != .text { commitTextEditing(); shapes += editableTexts; editableTexts.removeAll() } }
+    }
+    var strokeColor: NSColor = .systemRed { didSet { updateSelectedTextStyle() } }
     var strokeWidth: CGFloat = 4
+    var textPointSize: CGFloat = 20 { didSet { updateSelectedTextStyle() } }
+    var textFontName = NSFont.systemFont(ofSize: 16).familyName ?? "Helvetica Neue" { didSet { updateSelectedTextStyle() } }
+    var textWeight: TextWeight = .semibold { didSet { updateSelectedTextStyle() } }
+    var textUnderline = false { didSet { updateSelectedTextStyle() } }
+    private(set) var editableTexts: [AnnotationShape] = []
+    private(set) var selectedTextIndex: Int?
+    private var textEditor: CanvasTextView?
+    private var loadingTextStyle = false
+    private var textDragPoint: CGPoint?
+    var onTextSelectionChanged: (() -> Void)?
 
     private let image: NSImage
     private let imageSize: CGSize
-    private var shapes: [AnnotationShape] = []
+    private(set) var shapes: [AnnotationShape] = []
     private var currentPenPoints: [CGPoint] = []
     private var dragStart: CGPoint?
     private var dragCurrent: CGPoint?
@@ -779,6 +1012,8 @@ final class AnnotationCanvasView: NSView {
     override var acceptsFirstResponder: Bool { true }
 
     func clear() {
+        removeTextEditor()
+        editableTexts.removeAll()
         shapes.removeAll()
         currentPenPoints.removeAll()
         dragStart = nil
@@ -787,6 +1022,7 @@ final class AnnotationCanvasView: NSView {
     }
 
     func dispose() {
+        onTextSelectionChanged = nil
         clear()
         layer?.contents = nil
         removeFromSuperview()
@@ -794,14 +1030,18 @@ final class AnnotationCanvasView: NSView {
 
     func setCanvasDisplaySize(_ size: CGSize) {
         guard size.width > 1, size.height > 1, bounds.size != size else { return }
+        let selection = selectedTextIndex
+        commitTextEditing()
         let oldSize = CGSize(width: max(bounds.width, 1), height: max(bounds.height, 1))
         let scaleX = size.width / oldSize.width
         let scaleY = size.height / oldSize.height
         shapes = shapes.map { scaledShape($0, scaleX: scaleX, scaleY: scaleY) }
+        editableTexts = editableTexts.map { scaledShape($0, scaleX: scaleX, scaleY: scaleY) }
         currentPenPoints = currentPenPoints.map { scaledPoint($0, scaleX: scaleX, scaleY: scaleY) }
         dragStart = dragStart.map { scaledPoint($0, scaleX: scaleX, scaleY: scaleY) }
         dragCurrent = dragCurrent.map { scaledPoint($0, scaleX: scaleX, scaleY: scaleY) }
         frame = CGRect(origin: .zero, size: size)
+        if let selection, editableTexts.indices.contains(selection) { selectText(at: selection) }
         needsDisplay = true
     }
 
@@ -810,6 +1050,8 @@ final class AnnotationCanvasView: NSView {
         switch shape {
         case let .pen(points, color, lineWidth):
             return .pen(points.map { scaledPoint($0, scaleX: scaleX, scaleY: scaleY) }, color, lineWidth * lineScale)
+        case let .text(text, origin, color, fontSize, fontName, weight, underline):
+            return .text(text, scaledPoint(origin, scaleX: scaleX, scaleY: scaleY), color, fontSize * lineScale, fontName, weight, underline)
         case let .rectangle(rect, color, lineWidth):
             return .rectangle(scaledRect(rect, scaleX: scaleX, scaleY: scaleY), color, lineWidth * lineScale)
         case let .oval(rect, color, lineWidth):
@@ -832,8 +1074,15 @@ final class AnnotationCanvasView: NSView {
     }
 
     func renderedImage(scale: CGFloat = 1) -> NSImage {
-        let outputScale = max(scale, 1)
-        let outputSize = CGSize(width: imageSize.width * outputScale, height: imageSize.height * outputScale)
+        commitTextEditing()
+        let outputScale = CGFloat(ScreenshotExportScale.normalized(Double(scale)))
+        let source = ImageEncoding.sourceCGImage(from: image)
+        // 无批注的原始导出直接保留源位图，避免 Retina 降采样及多余重绘。
+        if outputScale == 1, shapes.isEmpty, editableTexts.isEmpty, let source {
+            return NSImage(cgImage: source, size: imageSize)
+        }
+        let nativeSize = source.map { CGSize(width: $0.width, height: $0.height) } ?? imageSize
+        let outputSize = CGSize(width: nativeSize.width * outputScale, height: nativeSize.height * outputScale)
         let pixelWidth = max(1, Int(outputSize.width.rounded()))
         let pixelHeight = max(1, Int(outputSize.height.rounded()))
         guard let context = CGContext(
@@ -849,10 +1098,19 @@ final class AnnotationCanvasView: NSView {
         }
         NSGraphicsContext.saveGraphicsState()
         NSGraphicsContext.current = NSGraphicsContext(cgContext: context, flipped: false)
+        NSGraphicsContext.current?.imageInterpolation = outputScale == 1 ? .none : .high
         let scaleX = outputSize.width / max(bounds.width, 1)
         let scaleY = outputSize.height / max(bounds.height, 1)
         context.scaleBy(x: scaleX, y: scaleY)
-        drawCanvas(in: bounds, includeDraft: false)
+        // 显式使用源位图，避免 AppKit 因预览点尺寸选择低分辨率 representation。
+        if let source {
+            context.interpolationQuality = outputScale == 1 ? .none : .high
+            context.draw(source, in: bounds)
+            shapes.forEach(drawShape)
+            editableTexts.forEach(drawShape)
+        } else {
+            drawCanvas(in: bounds, includeDraft: false)
+        }
         NSGraphicsContext.restoreGraphicsState()
         guard let cgImage = context.makeImage() else { return NSImage(size: outputSize) }
         return NSImage(cgImage: cgImage, size: outputSize)
@@ -874,6 +1132,17 @@ final class AnnotationCanvasView: NSView {
         dragCurrent = point
         if tool == .pen {
             currentPenPoints = [point]
+        } else if tool == .text {
+            let borderSelection = textEditor.flatMap { editor -> Int? in
+                editor.frame.insetBy(dx: -6, dy: -6).contains(point) && !editor.frame.insetBy(dx: 2, dy: 2).contains(point) ? selectedTextIndex : nil
+            }
+            commitTextEditing()
+            if let index = borderSelection.flatMap({ editableTexts.indices.contains($0) ? $0 : nil }) ?? editableTexts.indices.reversed().first(where: { shapeBounds(editableTexts[$0]).insetBy(dx: -6, dy: -6).contains(point) }) {
+                selectText(at: index)
+                textDragPoint = point
+            } else { beginText(at: point) }
+            dragStart = nil
+            dragCurrent = nil
         } else if tool == .eraser {
             eraseAnnotations(around: point)
         }
@@ -884,6 +1153,10 @@ final class AnnotationCanvasView: NSView {
         guard tool != .none else { return }
 
         let point = convert(event.locationInWindow, from: nil)
+        if tool == .text {
+            if let last = textDragPoint { moveSelectedText(by: CGSize(width: point.x - last.x, height: point.y - last.y)); textDragPoint = point }
+            return
+        }
         dragCurrent = point
         if tool == .pen {
             currentPenPoints.append(point)
@@ -894,6 +1167,7 @@ final class AnnotationCanvasView: NSView {
     }
 
     override func mouseUp(with event: NSEvent) {
+        textDragPoint = nil
         guard tool != .none else { return }
 
         dragCurrent = convert(event.locationInWindow, from: nil)
@@ -903,6 +1177,8 @@ final class AnnotationCanvasView: NSView {
         case .pen:
             if currentPenPoints.count > 1 { shapes.append(.pen(currentPenPoints, strokeColor, strokeWidth)) }
             currentPenPoints.removeAll()
+        case .text:
+            break
         case .eraser:
             if let dragCurrent { eraseAnnotations(around: dragCurrent) }
         case .rectangle:
@@ -938,6 +1214,15 @@ final class AnnotationCanvasView: NSView {
         NSBezierPath(rect: bounds).addClip()
         image.draw(in: rect, from: .zero, operation: .sourceOver, fraction: 1)
         shapes.forEach(drawShape)
+        for (index, shape) in editableTexts.enumerated() where !includeDraft || index != selectedTextIndex {
+            drawShape(shape)
+        }
+        if includeDraft, let editor = textEditor {
+            NSColor.controlAccentColor.setStroke()
+            let border = NSBezierPath(rect: editor.frame.insetBy(dx: -4, dy: -4))
+            border.lineWidth = 1
+            border.stroke()
+        }
         if includeDraft {
             drawDraft()
         }
@@ -950,6 +1235,8 @@ final class AnnotationCanvasView: NSView {
             break
         case .pen:
             drawPen(currentPenPoints, color: strokeColor, lineWidth: strokeWidth)
+        case .text:
+            break
         case .eraser:
             if let dragCurrent { drawEraser(at: dragCurrent) }
         case .rectangle:
@@ -969,6 +1256,8 @@ final class AnnotationCanvasView: NSView {
         switch shape {
         case let .pen(points, color, lineWidth):
             drawPen(points, color: color, lineWidth: lineWidth)
+        case let .text(text, origin, color, fontSize, fontName, weight, underline):
+            drawText(text, at: origin, color: color, fontSize: fontSize, fontName: fontName, weight: weight, underline: underline)
         case let .rectangle(rect, color, lineWidth):
             drawRectangle(rect, color: color, lineWidth: lineWidth)
         case let .oval(rect, color, lineWidth):
@@ -992,6 +1281,18 @@ final class AnnotationCanvasView: NSView {
         path.lineCapStyle = .round
         path.lineJoinStyle = .round
         path.stroke()
+    }
+
+    private func drawText(_ text: String, at origin: CGPoint, color: NSColor, fontSize: CGFloat, fontName: String, weight: TextWeight, underline: Bool) {
+        let attributes = textAttributes(color: color, size: fontSize, name: fontName, weight: weight, underline: underline)
+        let maxWidth = max(1, bounds.maxX - origin.x - 4)
+        let attributed = NSAttributedString(string: text, attributes: attributes)
+        let size = attributed.boundingRect(
+            with: CGSize(width: maxWidth, height: .greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin, .usesFontLeading]
+        ).integral.size
+        let drawRect = CGRect(x: origin.x, y: origin.y - size.height, width: maxWidth, height: size.height)
+        attributed.draw(with: drawRect, options: [.usesLineFragmentOrigin, .usesFontLeading])
     }
 
     private func drawRectangle(_ rect: CGRect, color: NSColor, lineWidth: CGFloat) {
@@ -1092,6 +1393,8 @@ final class AnnotationCanvasView: NSView {
         switch shape {
         case let .pen(points, _, lineWidth):
             return pointsBounds(points).insetBy(dx: -lineWidth, dy: -lineWidth)
+        case let .text(text, origin, _, fontSize, fontName, weight, _):
+            return textBounds(text, at: origin, fontSize: fontSize, fontName: fontName, weight: weight)
         case let .rectangle(rect, _, lineWidth), let .oval(rect, _, lineWidth):
             return rect.insetBy(dx: -lineWidth, dy: -lineWidth)
         case let .line(start, end, _, lineWidth), let .arrow(start, end, _, lineWidth):
@@ -1106,5 +1409,157 @@ final class AnnotationCanvasView: NSView {
         return points.dropFirst().reduce(CGRect(origin: first, size: .zero)) { rect, point in
             rect.union(CGRect(origin: point, size: .zero))
         }
+    }
+
+    private var textFontSize: CGFloat {
+        textPointSize
+    }
+
+    private func clampedTextOrigin(_ point: CGPoint) -> CGPoint {
+        CGPoint(
+            x: min(max(point.x, bounds.minX + 4), max(bounds.minX + 4, bounds.maxX - textFontSize - 8)),
+            y: min(max(point.y, bounds.minY + textFontSize + 4), bounds.maxY - 4)
+        )
+    }
+
+    private func textBounds(_ text: String, at origin: CGPoint, fontSize: CGFloat, fontName: String, weight: TextWeight) -> CGRect {
+        let attributes = textAttributes(color: .black, size: fontSize, name: fontName, weight: weight, underline: false)
+        let maxWidth = max(1, bounds.maxX - origin.x - 4)
+        let size = NSAttributedString(string: text, attributes: attributes).boundingRect(
+            with: CGSize(width: maxWidth, height: .greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin, .usesFontLeading]
+        ).integral.size
+        return CGRect(x: origin.x, y: origin.y - size.height, width: min(maxWidth, size.width), height: size.height)
+    }
+
+    // 仅当前文字工具会话中的对象可以进入编辑器；固定对象从不参与命中检测。
+    func beginText(at point: CGPoint) {
+        guard tool == .text else { return }
+        commitTextEditing()
+        editableTexts.append(.text("", clampedTextOrigin(point), strokeColor, textFontSize, textFontName, textWeight, textUnderline))
+        selectText(at: editableTexts.count - 1)
+    }
+
+    func selectText(at index: Int) {
+        guard tool == .text, editableTexts.indices.contains(index) else { return }
+        guard case let .text(text, _, color, size, name, weight, underline) = editableTexts[index] else { return }
+        removeTextEditor()
+        selectedTextIndex = index
+        loadingTextStyle = true
+        strokeColor = color
+        textPointSize = size
+        textFontName = name
+        textWeight = weight
+        textUnderline = underline
+        loadingTextStyle = false
+        let editor = CanvasTextView(frame: .zero)
+        editor.isRichText = false
+        editor.importsGraphics = false
+        editor.drawsBackground = false
+        editor.textContainerInset = .zero
+        editor.textContainer?.lineFragmentPadding = 0
+        // 容器保留边界换行宽度，视图只包围实际文字；禁止 AppKit 用视图宽度反写容器。
+        editor.textContainer?.widthTracksTextView = false
+        editor.textContainer?.heightTracksTextView = false
+        editor.isHorizontallyResizable = false
+        editor.isVerticallyResizable = false
+        editor.autoresizingMask = []
+        editor.isAutomaticQuoteSubstitutionEnabled = false
+        editor.isAutomaticDashSubstitutionEnabled = false
+        editor.allowsUndo = true
+        editor.toolTip = "直接输入文字；拖动边框移动，或按住 Option 拖动文字。Esc 结束当前输入。"
+        editor.string = text
+        editor.delegate = self
+        editor.onEscape = { [weak self] in self?.commitTextEditing() }
+        textEditor = editor
+        addSubview(editor)
+        updateSelectedTextStyle()
+        onTextSelectionChanged?()
+        window?.makeKey()
+        window?.makeFirstResponder(editor)
+        editor.setSelectedRange(NSRange(location: (text as NSString).length, length: 0))
+    }
+
+    private func removeTextEditor() {
+        if window?.firstResponder === textEditor { window?.makeFirstResponder(self) }
+        textEditor?.delegate = nil
+        textEditor?.onEscape = nil
+        textEditor?.removeFromSuperview()
+        textEditor = nil
+        selectedTextIndex = nil
+        textDragPoint = nil
+        needsDisplay = true
+    }
+
+    @discardableResult
+    func commitTextEditing() -> Bool {
+        guard let index = selectedTextIndex, let editor = textEditor else { return false }
+        // 将输入法的当前组合文本保存在对象中，再结束输入上下文。
+        editor.unmarkText()
+        updateSelectedTextStyle()
+        let isEmpty = editor.string.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        removeTextEditor()
+        if isEmpty { editableTexts.remove(at: index) }
+        return true
+    }
+
+    func textDidChange(_ notification: Notification) { updateSelectedTextStyle() }
+
+    private func updateSelectedTextStyle() {
+        guard !loadingTextStyle, let index = selectedTextIndex, let editor = textEditor,
+              editableTexts.indices.contains(index),
+              case let .text(_, origin, _, _, _, _, _) = editableTexts[index] else { return }
+        editableTexts[index] = .text(editor.string, origin, strokeColor, textPointSize, textFontName, textWeight, textUnderline)
+        let attributes = textAttributes(color: strokeColor, size: textPointSize, name: textFontName, weight: textWeight, underline: textUnderline)
+        editor.typingAttributes = attributes
+        // 组合输入期间不重写输入法的临时属性或选区。
+        if !editor.hasMarkedText() {
+            editor.textStorage?.setAttributes(attributes, range: NSRange(location: 0, length: (editor.string as NSString).length))
+        }
+        editor.insertionPointColor = strokeColor
+        layoutTextEditor()
+    }
+
+    private func layoutTextEditor() {
+        guard let index = selectedTextIndex, let editor = textEditor,
+              case let .text(text, origin, color, size, name, weight, underline) = editableTexts[index],
+              let container = editor.textContainer, let manager = editor.layoutManager else { return }
+        let maxWidth = max(1, bounds.maxX - origin.x - 4)
+        container.containerSize = CGSize(width: maxWidth, height: .greatestFiniteMagnitude)
+        manager.ensureLayout(for: container)
+        let used = manager.usedRect(for: container)
+        // 最后一处换行后的空行也需要容纳插入光标。
+        let extraHeight = manager.extraLineFragmentTextContainer === container ? manager.extraLineFragmentRect.maxY : 0
+        let width = min(maxWidth, max(text.isEmpty ? 12 : 1, ceil(used.maxX) + 2))
+        let height = min(max(1, bounds.height - 8), max(ceil(size * 1.3), ceil(max(used.maxY, extraHeight))))
+        let top = min(bounds.maxY - 4, max(origin.y, bounds.minY + height + 4))
+        editableTexts[index] = .text(text, CGPoint(x: origin.x, y: top), color, size, name, weight, underline)
+        // NSTextView 为翻转坐标系，画布不是：保持文字左上角不随输入行数变化。
+        editor.frame = CGRect(x: origin.x, y: top - height, width: width, height: height)
+        needsDisplay = true
+    }
+
+    func moveSelectedText(by delta: CGSize) {
+        guard let index = selectedTextIndex,
+              case let .text(text, origin, color, size, name, weight, underline) = editableTexts[index] else { return }
+        let next = clampedTextOrigin(CGPoint(x: origin.x + delta.width, y: origin.y + delta.height))
+        editableTexts[index] = .text(text, next, color, size, name, weight, underline)
+        layoutTextEditor()
+    }
+
+    private func textAttributes(color: NSColor, size: CGFloat, name: String, weight: TextWeight, underline: Bool) -> [NSAttributedString.Key: Any] {
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineBreakMode = .byWordWrapping
+        return [.font: textFont(name: name, size: size, weight: weight), .foregroundColor: color,
+                .paragraphStyle: paragraph, .strokeColor: NSColor.black.withAlphaComponent(0.18),
+                .strokeWidth: -1.5, .underlineStyle: underline ? NSUnderlineStyle.single.rawValue : 0]
+    }
+
+    private func textFont(name: String, size: CGFloat, weight: TextWeight) -> NSFont {
+        if let font = NSFont(name: name, size: size),
+           let weighted = NSFont(descriptor: font.fontDescriptor.addingAttributes([
+            .traits: [NSFontDescriptor.TraitKey.weight: weight.fontWeight.rawValue]
+           ]), size: size) { return weighted }
+        return .systemFont(ofSize: size, weight: weight.fontWeight)
     }
 }

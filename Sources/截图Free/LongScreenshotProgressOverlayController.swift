@@ -11,6 +11,8 @@ final class LongScreenshotProgressOverlayController {
     private var avoidedFrame: CGRect?
     private var isThumbnailVisible = false
     private var doubleClickMonitor: Any?
+    private var isCaptureHidden = false
+    private var isClosed = false
 
     init(selectionRect: CGRect) {
         self.selectionRect = selectionRect
@@ -51,33 +53,40 @@ final class LongScreenshotProgressOverlayController {
     }
 
     func show() {
+        guard !isClosed else { return }
         thumbnailView.update(image: nil, frameCount: 0)
         positionThumbnail(size: thumbnailWindow.frame.size)
         startDoubleClickMonitor()
-        borderWindow.orderFrontRegardless()
-        if isThumbnailVisible {
-            thumbnailWindow.orderFrontRegardless()
-        }
+        restoreVisibleWindows()
     }
 
     func updatePreview(image: NSImage, frameCount: Int) {
+        guard !isClosed else { return }
         let size = thumbnailSize(for: image)
         thumbnailWindow.setContentSize(size)
         thumbnailView.frame = CGRect(origin: .zero, size: size)
         thumbnailView.update(image: image, frameCount: frameCount)
         positionThumbnail(size: size)
-        if isThumbnailVisible {
-            thumbnailWindow.orderFrontRegardless()
-        }
+        restoreVisibleWindows()
         AppLogger.log("manual long screenshot preview updated frames=\(frameCount) size=\(image.size) window=\(thumbnailWindow.frame)")
     }
 
     func setSelectionBorderHidden(_ isHidden: Bool) {
+        guard !isClosed else { return }
+        // 保留协调器调用接口，但必须连缩略图及阴影一起隐藏。
+        isCaptureHidden = isHidden
         if isHidden {
             borderWindow.orderOut(nil)
+            thumbnailWindow.orderOut(nil)
         } else {
-            borderWindow.orderFrontRegardless()
+            restoreVisibleWindows()
         }
+    }
+
+    private func restoreVisibleWindows() {
+        guard !isClosed, !isCaptureHidden else { return }
+        borderWindow.orderFrontRegardless()
+        if isThumbnailVisible { thumbnailWindow.orderFrontRegardless() }
     }
 
     func avoid(frame: CGRect) {
@@ -86,6 +95,8 @@ final class LongScreenshotProgressOverlayController {
     }
 
     func close() {
+        guard !isClosed else { return }
+        isClosed = true
         stopDoubleClickMonitor()
         borderWindow.orderOut(nil)
         thumbnailWindow.orderOut(nil)
