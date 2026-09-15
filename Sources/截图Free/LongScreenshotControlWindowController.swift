@@ -9,10 +9,10 @@ final class LongScreenshotControlWindowController: NSWindowController {
 
     private let statusLabel = NSTextField(labelWithString: "")
     private let hintLabel = NSTextField(labelWithString: "")
-    private let captureButton = NSButton(title: "截取当前段", target: nil, action: nil)
-    private let autoScrollButton = NSButton(title: "自动滚动", target: nil, action: nil)
-    private let finishButton = NSButton(title: "完成", target: nil, action: nil)
-    private let cancelButton = NSButton(title: "取消", target: nil, action: nil)
+    private let captureButton = GlassButton(title: "截取当前段", target: nil, action: nil)
+    private let autoScrollButton = GlassButton(title: "自动滚动", target: nil, action: nil)
+    private let finishButton = GlassButton(title: "完成", target: nil, action: nil)
+    private let cancelButton = GlassButton(title: "取消", target: nil, action: nil)
     private var frameCount = 0
     private var isAutoScrolling = false
 
@@ -24,6 +24,8 @@ final class LongScreenshotControlWindowController: NSWindowController {
             defer: false
         )
         window.title = "长截图"
+        GlassView.prepareWindow(window)
+        window.contentView = GlassView(frame: window.contentView?.bounds ?? .zero)
         window.level = .floating
         window.isReleasedWhenClosed = false
         window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
@@ -43,6 +45,7 @@ final class LongScreenshotControlWindowController: NSWindowController {
             positionNearTopRight()
         }
         window?.orderFrontRegardless()
+        GlassMotion.reveal(window?.contentView)
     }
 
     var currentFrame: CGRect? {
@@ -91,6 +94,7 @@ final class LongScreenshotControlWindowController: NSWindowController {
     func setAutoScrolling(_ isAutoScrolling: Bool) {
         self.isAutoScrolling = isAutoScrolling
         autoScrollButton.title = isAutoScrolling ? "停止自动" : "自动滚动"
+        autoScrollButton.state = isAutoScrolling ? .on : .off
         captureButton.isEnabled = !isAutoScrolling
         hintLabel.stringValue = isAutoScrolling ? "正在自动滚动并截取，可随时停止。" : "可手动滚动，也可点击“自动滚动”。"
     }
@@ -112,6 +116,7 @@ final class LongScreenshotControlWindowController: NSWindowController {
         stack.translatesAutoresizingMaskIntoConstraints = false
 
         statusLabel.font = .systemFont(ofSize: 15, weight: .semibold)
+        statusLabel.textColor = .labelColor
         hintLabel.font = .systemFont(ofSize: 12)
         hintLabel.textColor = .secondaryLabelColor
 

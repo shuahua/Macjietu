@@ -2,6 +2,8 @@ import AppKit
 import Carbon.HIToolbox
 
 final class ShortcutManager {
+    // 多个独立注册器共用应用事件目标，ID 必须进程内唯一。
+    private static var nextIdentifier: UInt32 = 1
     struct RegistrationStatus {
         let shortcut: Shortcut
         let isRegistered: Bool
@@ -27,8 +29,13 @@ final class ShortcutManager {
         unregister()
 
         installEventHandlerIfNeeded()
-        for (index, item) in shortcuts.enumerated() {
-            let identifier = UInt32(index + 1)
+        guard eventHandler != nil else {
+            statuses = shortcuts.map { RegistrationStatus(shortcut: $0.0, isRegistered: false, errorCode: OSStatus(eventInternalErr)) }
+            return
+        }
+        for item in shortcuts {
+            let identifier = Self.nextIdentifier
+            Self.nextIdentifier &+= 1
             var hotKeyRef: EventHotKeyRef?
             let signature = OSType(UInt32(0x53434E50))
             let hotKeyID = EventHotKeyID(signature: signature, id: identifier)
@@ -84,7 +91,10 @@ final class ShortcutManager {
             )
             guard status == noErr else { return status }
             let manager = Unmanaged<ShortcutManager>.fromOpaque(userData).takeUnretainedValue()
-            manager.handlers[hotKeyID.id]?()
+            guard hotKeyID.signature == OSType(0x53434E50), let handler = manager.handlers[hotKeyID.id] else {
+                return OSStatus(eventNotHandledErr)
+            }
+            handler()
             return noErr
         }, 1, &eventType, selfPointer, &eventHandler)
     }

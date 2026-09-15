@@ -38,6 +38,11 @@ enum TextWeight: Int {
     }
 }
 
+private final class AnnotationOptionsPanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { false }
+}
+
 private final class AnnotationEditorWindow: NSWindow {
     var onEscape: (() -> Void)?
     override var canBecomeKey: Bool { true }
@@ -55,11 +60,36 @@ private final class AnnotationEditorWindow: NSWindow {
     }
 }
 
+/// 图片展示装饰层：圆角只作用于显示层，导出仍由 AnnotationCanvasView 生成原始像素。
+final class MediaDisplayView: NSView {
+    static let cornerRadius: CGFloat = 11
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.masksToBounds = false
+        layer?.shadowColor = NSColor.black.cgColor
+        layer?.shadowOpacity = 0.16
+        layer?.shadowRadius = 10
+        layer?.shadowOffset = CGSize(width: 0, height: -2)
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override func layout() {
+        super.layout()
+        subviews.first?.frame = bounds
+        subviews.first?.layer?.cornerRadius = Self.cornerRadius
+        subviews.first?.layer?.masksToBounds = true
+        layer?.shadowPath = CGPath(roundedRect: bounds, cornerWidth: Self.cornerRadius, cornerHeight: Self.cornerRadius, transform: nil)
+    }
+}
+
 @MainActor
 final class AnnotationEditorController: NSObject {
     private let minimumToolbarWidth: CGFloat = 560
-    private let horizontalPadding: CGFloat = 20
-    private let verticalPadding: CGFloat = 16
+    private let horizontalPadding = GlassView.shadowPadding
+    private let verticalPadding = GlassView.shadowPadding
     private let topSafePadding: CGFloat = 36
     var onComplete: ((NSImage) -> Void)?
     var onCancel: (() -> Void)?
@@ -75,7 +105,7 @@ final class AnnotationEditorController: NSObject {
     private var contentView: NSView?
     private var canvasView: AnnotationCanvasView?
     private var scrollView: NSScrollView?
-    private var toolbarView: NSVisualEffectView?
+    private var toolbarView: GlassView?
     private var optionsWindow: NSPanel?
     private var resizeHandleView: ResizeHandleView?
     private var baseCanvasSize: CGSize = .zero
@@ -114,8 +144,8 @@ final class AnnotationEditorController: NSObject {
     }
 
     private func showLongScreenshotEditor() {
-        let horizontalPadding: CGFloat = 20
-        let verticalPadding: CGFloat = 16
+        let horizontalPadding = self.horizontalPadding
+        let verticalPadding = self.verticalPadding
         let topSafePadding: CGFloat = 36
         let toolbarHeight: CGFloat = 62
         let screenFrame = NSScreen.main?.visibleFrame ?? CGRect(x: 0, y: 0, width: 1440, height: 900)
@@ -138,17 +168,21 @@ final class AnnotationEditorController: NSObject {
             height: viewportSize.height
         )
         let canvas = AnnotationCanvasView(frame: CGRect(origin: .zero, size: canvasSize), image: image)
-        let scrollView = NSScrollView(frame: canvasFrame)
+        let display = MediaDisplayView(frame: canvasFrame)
+        let scrollView = NSScrollView(frame: display.bounds)
         scrollView.hasVerticalScroller = true
         scrollView.hasHorizontalScroller = true
         scrollView.borderType = .noBorder
         scrollView.drawsBackground = false
+        scrollView.contentView.drawsBackground = false
         scrollView.documentView = canvas
         scrollView.autohidesScrollers = false
         scrollView.allowsMagnification = false
         scrollView.wantsLayer = true
-        scrollView.layer?.cornerRadius = 12
-        contentView.addSubview(scrollView)
+        scrollView.layer?.cornerRadius = MediaDisplayView.cornerRadius
+        scrollView.layer?.masksToBounds = true
+        display.addSubview(scrollView)
+        contentView.addSubview(display)
         let resizeHandle = ResizeHandleView(frame: resizeHandleFrame(for: canvasFrame))
         resizeHandle.onResize = { [weak self] delta in self?.resizeLongScreenshot(by: delta) }
         contentView.addSubview(resizeHandle)
@@ -169,8 +203,8 @@ final class AnnotationEditorController: NSObject {
     }
 
     private func showStandardEditor() {
-        let horizontalPadding: CGFloat = 20
-        let verticalPadding: CGFloat = 16
+        let horizontalPadding = self.horizontalPadding
+        let verticalPadding = self.verticalPadding
         let topSafePadding: CGFloat = 36
         let toolbarHeight: CGFloat = 62
         let screenFrame = NSScreen.main?.visibleFrame ?? CGRect(x: 0, y: 0, width: 1440, height: 900)
@@ -191,8 +225,10 @@ final class AnnotationEditorController: NSObject {
             width: canvasSize.width,
             height: canvasSize.height
         )
-        let canvas = AnnotationCanvasView(frame: canvasFrame, image: image)
-        contentView.addSubview(canvas)
+        let canvas = AnnotationCanvasView(frame: CGRect(origin: .zero, size: canvasFrame.size), image: image)
+        let display = MediaDisplayView(frame: canvasFrame)
+        display.addSubview(canvas)
+        contentView.addSubview(display)
         self.contentView = contentView
         canvasView = canvas
         scrollView = nil
@@ -223,7 +259,8 @@ final class AnnotationEditorController: NSObject {
         window.backgroundColor = .clear
         window.isOpaque = false
         window.level = .floating
-        window.hasShadow = true
+        // 透明根容器中有互相分离的画布和工具栏，不生成整窗复合阴影。
+        window.hasShadow = false
         return window
     }
 
@@ -472,7 +509,7 @@ final class AnnotationEditorController: NSObject {
             weightPopup.action = #selector(self.textWeightChanged(_:))
             contentView.addSubview(weightPopup)
 
-            let underline = NSButton(checkboxWithTitle: "下划线", target: self, action: #selector(self.textUnderlineChanged(_:)))
+            let underline = GlassButton(checkboxWithTitle: "下划线", target: self, action: #selector(self.textUnderlineChanged(_:)))
             underline.frame = CGRect(x: weightPopup.frame.maxX + 10, y: 90, width: 74, height: 22)
             underline.state = self.textUnderline ? .on : .off
             contentView.addSubview(underline)
@@ -486,12 +523,14 @@ final class AnnotationEditorController: NSObject {
         closeOptionsWindow()
         guard let window else { return }
         let panel = Self.makeOptionsPanel(size: size)
-        guard let contentView = panel.contentView?.subviews.first as? NSVisualEffectView else { return }
-        build(contentView)
+        guard let contentView = panel.contentView as? GlassView else { return }
+        build(contentView.controlsHost)
         let frame = window.frame
         let visible = window.screen?.visibleFrame ?? frame
-        let preferredY = frame.minY - size.height - 10
-        let y = preferredY >= visible.minY ? preferredY : frame.maxY + 10
+        // 以主窗口可见内容边缘定位；shadowPadding 只服务于外框，不参与菜单间距。
+        let gap: CGFloat = 7
+        let preferredY = frame.minY - size.height - gap
+        let y = preferredY >= visible.minY ? preferredY : frame.maxY + gap
         panel.setFrameOrigin(CGPoint(
             x: max(visible.minX, min(frame.midX - size.width / 2, visible.maxX - size.width)),
             y: max(visible.minY, min(y, visible.maxY - size.height))
@@ -499,11 +538,14 @@ final class AnnotationEditorController: NSObject {
         window.addChildWindow(panel, ordered: .above)
         panel.orderFront(nil)
         optionsWindow = panel
+        GlassMotion.reveal(contentView)
     }
 
     static func makeOptionsPanel(size: CGSize) -> NSPanel {
         let bounds = CGRect(origin: .zero, size: size)
-        let panel = NSPanel(contentRect: bounds, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        let panel = AnnotationOptionsPanel(contentRect: bounds, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        panel.title = "标注参数"
+        panel.becomesKeyOnlyIfNeeded = true
         panel.backgroundColor = .clear
         panel.isOpaque = false
         panel.hasShadow = true
@@ -511,27 +553,7 @@ final class AnnotationEditorController: NSObject {
         panel.isReleasedWhenClosed = false
         panel.hidesOnDeactivate = false
 
-        // 独立透明容器裁剪整个效果层及控件；仅设置 cornerRadius 不会裁剪子层。
-        let clipView = NSView(frame: bounds)
-        clipView.wantsLayer = true
-        clipView.layer?.backgroundColor = NSColor.clear.cgColor
-        clipView.layer?.cornerRadius = 14
-        clipView.layer?.masksToBounds = true
-        clipView.layer?.borderWidth = 0
-        clipView.layer?.borderColor = nil
-        let effect = NSVisualEffectView(frame: bounds)
-        effect.autoresizingMask = [.width, .height]
-        effect.material = .popover
-        // 独立透明浮窗应采样窗后背景，而不是空的窗内背景。
-        effect.blendingMode = .behindWindow
-        effect.state = .active
-        effect.wantsLayer = true
-        effect.layer?.cornerRadius = 14
-        effect.layer?.masksToBounds = true
-        effect.layer?.borderWidth = 0
-        effect.layer?.borderColor = nil
-        clipView.addSubview(effect)
-        panel.contentView = clipView
+        panel.contentView = GlassView(frame: bounds)
         return panel
     }
 
@@ -569,7 +591,7 @@ final class AnnotationEditorController: NSObject {
         let valueLabel = NSTextField(labelWithString: "\(Int(value.rounded())) \(isText ? "pt" : "px")")
         valueLabel.frame = CGRect(x: slider.frame.maxX + 6, y: y + 5, width: 44, height: 18)
         valueLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .medium)
-        valueLabel.textColor = NSColor.labelColor.withAlphaComponent(0.82)
+        valueLabel.textColor = .labelColor
         contentView.addSubview(valueLabel)
         strokeValueLabel = valueLabel
     }
@@ -584,7 +606,7 @@ final class AnnotationEditorController: NSObject {
         let label = NSTextField(labelWithString: title)
         label.frame = CGRect(x: x, y: y, width: width, height: 18)
         label.font = .systemFont(ofSize: 11, weight: .medium)
-        label.textColor = NSColor.labelColor.withAlphaComponent(0.82)
+        label.textColor = .secondaryLabelColor
         contentView.addSubview(label)
         return label
     }
@@ -670,22 +692,14 @@ final class AnnotationEditorController: NSObject {
     }
 
     private func addStandardToolbar(to contentView: NSView, toolbarSize: CGSize, origin: CGPoint) {
-        let toolbar = NSVisualEffectView(frame: CGRect(origin: origin, size: toolbarSize))
-        toolbar.material = .popover
-        toolbar.blendingMode = .withinWindow
-        toolbar.state = .active
-        toolbar.wantsLayer = true
-        toolbar.layer?.cornerRadius = 16
-        toolbar.layer?.borderWidth = 1
-        toolbar.layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.45).cgColor
-        toolbar.layer?.shadowColor = NSColor.black.cgColor
-        toolbar.layer?.shadowOpacity = 0.18
-        toolbar.layer?.shadowRadius = 14
-        toolbar.layer?.shadowOffset = CGSize(width: 0, height: 4)
+        let toolbar = GlassView(frame: CGRect(origin: origin, size: toolbarSize))
+        toolbar.castsSoftShadow = true
         contentView.addSubview(toolbar)
         toolbarView = toolbar
 
-        let leftInset: CGFloat = 16
+        // 控件组按实际 fit 宽度居中，而不是让固定宽度外框看起来偏左。
+        let fittedGroupWidth: CGFloat = 482
+        let leftInset: CGFloat = max(8, (toolbarSize.width - fittedGroupWidth) / 2)
         let topRowY = toolbarSize.height - 46
         let toolControl = NSSegmentedControl(images: [
             systemImage("pencil.tip"),
@@ -717,6 +731,7 @@ final class AnnotationEditorController: NSObject {
         shapePopup.toolTip = "形状：矩形"
         shapePopup.wantsLayer = true
         shapePopup.layer?.cornerRadius = 6
+        shapePopup.layer?.masksToBounds = true
         toolbar.addSubview(shapePopup)
         self.shapePopup = shapePopup
 
@@ -734,7 +749,7 @@ final class AnnotationEditorController: NSObject {
         let zoomLabel = NSTextField(labelWithString: "缩放")
         zoomLabel.frame = CGRect(x: leftInset, y: zoomRowY + 6, width: 32, height: 18)
         zoomLabel.font = .systemFont(ofSize: 11, weight: .medium)
-        zoomLabel.textColor = NSColor.labelColor.withAlphaComponent(0.82)
+        zoomLabel.textColor = .secondaryLabelColor
         toolbar.addSubview(zoomLabel)
 
         let zoomSlider = NSSlider(value: 1, minValue: 0.25, maxValue: 4.0, target: self, action: #selector(zoomSliderChanged(_:)))
@@ -747,15 +762,15 @@ final class AnnotationEditorController: NSObject {
         let zoomValueLabel = NSTextField(labelWithString: "1.0x")
         zoomValueLabel.frame = CGRect(x: zoomSlider.frame.maxX + 6, y: zoomRowY + 6, width: 44, height: 18)
         zoomValueLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .medium)
-        zoomValueLabel.textColor = NSColor.labelColor.withAlphaComponent(0.82)
+        zoomValueLabel.textColor = .labelColor
         toolbar.addSubview(zoomValueLabel)
         self.zoomValueLabel = zoomValueLabel
     }
 
     private func applyZoomScale() {
         guard allowsZoom, let canvasView, let scrollView, let contentView, let toolbarView, let window else { return }
-        let horizontalPadding: CGFloat = 20
-        let verticalPadding: CGFloat = 16
+        let horizontalPadding = self.horizontalPadding
+        let verticalPadding = self.verticalPadding
         let topSafePadding: CGFloat = 36
         let toolbarHeight: CGFloat = showsZoomControls ? 102 : 62
         let screenFrame = NSScreen.main?.visibleFrame ?? CGRect(x: 0, y: 0, width: 1440, height: 900)
@@ -806,7 +821,8 @@ final class AnnotationEditorController: NSObject {
 
     private func addColorWells(to toolbar: NSView, origin: CGPoint) {
         colorWells = colors.enumerated().map { index, color in
-            let button = NSButton(frame: CGRect(x: origin.x + CGFloat(index) * 32, y: origin.y, width: 24, height: 24))
+            let button = GlassButton(frame: CGRect(x: origin.x + CGFloat(index) * 32, y: origin.y, width: 24, height: 24))
+            button.setAccessibilityLabel("标注颜色 \(index + 1)")
             button.title = ""
             button.bezelStyle = .regularSquare
             button.isBordered = false
@@ -817,6 +833,7 @@ final class AnnotationEditorController: NSObject {
             button.state = selected ? .on : .off
             button.wantsLayer = true
             button.layer?.cornerRadius = 12
+            button.layer?.masksToBounds = true
             button.layer?.backgroundColor = color.cgColor
             button.layer?.borderWidth = selected ? 3 : 1
             button.layer?.borderColor = NSColor.white.withAlphaComponent(selected ? 0.95 : 0.35).cgColor
@@ -824,7 +841,8 @@ final class AnnotationEditorController: NSObject {
             return button
         }
 
-        let customButton = NSButton(frame: CGRect(x: origin.x + CGFloat(colors.count) * 32 + 8, y: origin.y, width: 28, height: 24))
+        let customButton = GlassButton(frame: CGRect(x: origin.x + CGFloat(colors.count) * 32 + 8, y: origin.y, width: 28, height: 24))
+        customButton.setAccessibilityLabel("打开调色盘")
         customButton.title = ""
         customButton.image = systemImage("paintpalette")
         customButton.imagePosition = .imageOnly
@@ -835,6 +853,7 @@ final class AnnotationEditorController: NSObject {
         customButton.action = #selector(showColorPanel)
         customButton.wantsLayer = true
         customButton.layer?.cornerRadius = 12
+        customButton.layer?.masksToBounds = true
         customButton.layer?.backgroundColor = NSColor(calibratedWhite: 0.18, alpha: 1).cgColor
         customButton.layer?.borderWidth = 1
         customButton.layer?.borderColor = NSColor.white.withAlphaComponent(0.35).cgColor
@@ -844,12 +863,16 @@ final class AnnotationEditorController: NSObject {
 
     @discardableResult
     private func addIconButton(symbolName: String, tooltip: String, x: CGFloat, y: CGFloat, action: Selector, to contentView: NSView, isDestructive: Bool = false) -> NSButton {
-        let button = NSButton(image: systemImage(symbolName), target: self, action: action)
+        let button = GlassButton(image: systemImage(symbolName), target: self, action: action)
+        button.setAccessibilityLabel(tooltip)
         button.frame = CGRect(x: x, y: y, width: 34, height: 30)
         button.bezelStyle = .rounded
         button.controlSize = .regular
         button.imagePosition = .imageOnly
         button.toolTip = tooltip
+        if ["trash", "doc.on.doc", "square.and.arrow.down", "pin"].contains(symbolName) {
+            button.useMomentaryActionSurface()
+        }
         if isDestructive {
             button.contentTintColor = .systemRed
         }
@@ -902,6 +925,7 @@ private final class ResizeHandleView: NSView {
         super.init(frame: frameRect)
         wantsLayer = true
         layer?.cornerRadius = 5
+        layer?.masksToBounds = true
         layer?.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.7).cgColor
     }
 
@@ -965,6 +989,17 @@ private final class CanvasTextView: NSTextView {
     }
 }
 
+private final class TextResizeHandle: NSView {
+    var onDelta: ((CGFloat) -> Void)?
+    private var last: CGPoint?
+    override init(frame: NSRect) { super.init(frame: frame); wantsLayer = true; layer?.backgroundColor = NSColor.controlAccentColor.cgColor; layer?.cornerRadius = 3 }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+    override func resetCursorRects() { addCursorRect(bounds, cursor: .crosshair) }
+    override func mouseDown(with event: NSEvent) { last = event.locationInWindow }
+    override func mouseDragged(with event: NSEvent) { let p = event.locationInWindow; if let last { onDelta?(p.x - last.x) }; last = p }
+    override func mouseUp(with event: NSEvent) { last = nil }
+}
+
 final class AnnotationCanvasView: NSView, NSTextViewDelegate {
     var tool: AnnotationTool = .none {
         willSet { if tool == .text && newValue != .text { commitTextEditing(); shapes += editableTexts; editableTexts.removeAll() } }
@@ -978,6 +1013,7 @@ final class AnnotationCanvasView: NSView, NSTextViewDelegate {
     private(set) var editableTexts: [AnnotationShape] = []
     private(set) var selectedTextIndex: Int?
     private var textEditor: CanvasTextView?
+    private var textResizeHandle: TextResizeHandle?
     private var loadingTextStyle = false
     private var textDragPoint: CGPoint?
     var onTextSelectionChanged: (() -> Void)?
@@ -995,14 +1031,12 @@ final class AnnotationCanvasView: NSView, NSTextViewDelegate {
         super.init(frame: frame)
         wantsLayer = true
         layer?.backgroundColor = NSColor.clear.cgColor
-        layer?.cornerRadius = 10
-        layer?.masksToBounds = false
-        layer?.borderWidth = 1
-        layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.55).cgColor
-        layer?.shadowColor = NSColor.black.cgColor
-        layer?.shadowOpacity = 0.2
-        layer?.shadowRadius = 12
-        layer?.shadowOffset = CGSize(width: 0, height: 4)
+        // 画布不是装饰面板：完整展示矩形源图，去掉外溢边框和重复阴影。
+        layer?.cornerRadius = 0
+        layer?.masksToBounds = true
+        layer?.borderWidth = 0
+        layer?.borderColor = nil
+        layer?.shadowOpacity = 0
     }
 
     required init?(coder: NSCoder) {
@@ -1026,6 +1060,17 @@ final class AnnotationCanvasView: NSView, NSTextViewDelegate {
         clear()
         layer?.contents = nil
         removeFromSuperview()
+    }
+
+    private func resizeSelectedText(by delta: CGFloat) {
+        guard let index = selectedTextIndex, let editor = textEditor,
+              case let .text(text, origin, color, size, name, weight, underline) = editableTexts[index] else { return }
+        let next = min(max(size + delta * 0.35, 12), 80)
+        guard abs(next - size) > 0.01 else { return }
+        editableTexts[index] = .text(text, origin, color, next, name, weight, underline)
+        textPointSize = next
+        updateSelectedTextStyle()
+        _ = editor
     }
 
     func setCanvasDisplaySize(_ size: CGSize) {
@@ -1473,6 +1518,10 @@ final class AnnotationCanvasView: NSView, NSTextViewDelegate {
         editor.onEscape = { [weak self] in self?.commitTextEditing() }
         textEditor = editor
         addSubview(editor)
+        let handle = TextResizeHandle(frame: .zero)
+        handle.onDelta = { [weak self] delta in self?.resizeSelectedText(by: delta) }
+        addSubview(handle)
+        textResizeHandle = handle
         updateSelectedTextStyle()
         onTextSelectionChanged?()
         window?.makeKey()
@@ -1485,6 +1534,8 @@ final class AnnotationCanvasView: NSView, NSTextViewDelegate {
         textEditor?.delegate = nil
         textEditor?.onEscape = nil
         textEditor?.removeFromSuperview()
+        textResizeHandle?.removeFromSuperview()
+        textResizeHandle = nil
         textEditor = nil
         selectedTextIndex = nil
         textDragPoint = nil
@@ -1536,6 +1587,7 @@ final class AnnotationCanvasView: NSView, NSTextViewDelegate {
         editableTexts[index] = .text(text, CGPoint(x: origin.x, y: top), color, size, name, weight, underline)
         // NSTextView 为翻转坐标系，画布不是：保持文字左上角不随输入行数变化。
         editor.frame = CGRect(x: origin.x, y: top - height, width: width, height: height)
+        textResizeHandle?.frame = CGRect(x: editor.frame.maxX - 8, y: editor.frame.minY - 8, width: 14, height: 14)
         needsDisplay = true
     }
 

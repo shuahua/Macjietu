@@ -23,6 +23,23 @@ struct AppSettings: Codable, Equatable {
     var launchAtLogin: Bool
     var saveDirectory: URL?
     var exportScale: Double
+    // 缺少整个字典才是旧格式；字典中缺项表示明确清除，不补默认。
+    var shortcuts: [String: Shortcut]? = nil
+
+    func shortcut(for action: ShortcutAction) -> Shortcut? {
+        if let shortcuts { return shortcuts[action.rawValue] }
+        return action == .area ? captureShortcut : action.legacyDefault
+    }
+
+    mutating func setShortcut(_ shortcut: Shortcut?, for action: ShortcutAction) {
+        if shortcuts == nil {
+            shortcuts = Dictionary(uniqueKeysWithValues: ShortcutAction.allCases.compactMap { action in
+                self.shortcut(for: action).map { (action.rawValue, $0) }
+            })
+        }
+        shortcuts?[action.rawValue] = shortcut
+        if action == .area, let shortcut { captureShortcut = shortcut }
+    }
 
     static let defaults = AppSettings(
         captureShortcut: .defaultCapture,
@@ -43,6 +60,7 @@ struct AppSettings: Codable, Equatable {
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         captureShortcut = try container.decode(Shortcut.self, forKey: .captureShortcut)
+        shortcuts = try container.decodeIfPresent([String: Shortcut].self, forKey: .shortcuts)
         autoCopyAfterCapture = try container.decode(Bool.self, forKey: .autoCopyAfterCapture)
         launchAtLogin = try container.decodeIfPresent(Bool.self, forKey: .launchAtLogin) ?? Self.defaults.launchAtLogin
         saveDirectory = try container.decodeIfPresent(URL.self, forKey: .saveDirectory)

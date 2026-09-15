@@ -14,18 +14,21 @@ final class AnnotationToolOptionsTests: XCTestCase {
         XCTAssertTrue(panel.styleMask.contains(.borderless), file: file, line: line)
         XCTAssertTrue(panel.hasShadow, file: file, line: line)
         let clip = try XCTUnwrap(panel.contentView)
-        let effect = try XCTUnwrap(clip.subviews.first as? NSVisualEffectView)
-        XCTAssertEqual(clip.layer?.backgroundColor?.alpha, 0, file: file, line: line)
+        let glass = try XCTUnwrap(clip as? GlassView)
+        let effect = glass.effectView
+        // 功能玻璃需要非零 backing；窗口外透明区域仍保持零 alpha。
+        XCTAssertEqual(clip.layer?.backgroundColor?.alpha, GlassView.interactionBackingOpacity, file: file, line: line)
         for view in [clip, effect] {
             XCTAssertEqual(view.layer?.cornerRadius, 14, file: file, line: line)
-            XCTAssertEqual(view.layer?.masksToBounds, true, file: file, line: line)
+            if glass.backend != .native { XCTAssertEqual(view.layer?.masksToBounds, true, file: file, line: line) }
             XCTAssertEqual(view.layer?.borderWidth, 0, file: file, line: line)
             XCTAssertNil(view.layer?.borderColor, file: file, line: line)
         }
         XCTAssertEqual(effect.frame, clip.bounds, file: file, line: line)
-        XCTAssertEqual(effect.material, .popover, file: file, line: line)
+        XCTAssertEqual(effect.material, .hudWindow, file: file, line: line)
         XCTAssertEqual(effect.blendingMode, .behindWindow, file: file, line: line)
-        XCTAssertEqual(effect.state, .active, file: file, line: line)
+        XCTAssertEqual(effect.state, glass.reducesTransparency ? .inactive : .active, file: file, line: line)
+        XCTAssertEqual(glass.tintOpacity, glass.reducesTransparency ? 1 : GlassView.normalTintOpacity)
     }
 
     func testGlassPanelResizesWithoutUncoveredEdgesInBothAppearances() throws {

@@ -13,6 +13,18 @@ final class LongScreenshotProgressOverlayController {
     private var doubleClickMonitor: Any?
     private var isCaptureHidden = false
     private var isClosed = false
+    private(set) var previewImage: NSImage?
+    private let finishButton = GlassButton(title: "完成长截图", target: nil, action: nil)
+    var captureWindowIDs: Set<CGWindowID> {
+        Set([borderWindow, thumbnailWindow].filter { $0.windowNumber > 0 }.map { CGWindowID($0.windowNumber) })
+    }
+
+    func setStatus(_ text: String?) {
+        thumbnailView.statusText = text
+        thumbnailView.needsDisplay = true
+    }
+
+    @objc private func finishClicked() { onDoubleClickSelection?() }
 
     init(selectionRect: CGRect) {
         self.selectionRect = selectionRect
@@ -40,14 +52,22 @@ final class LongScreenshotProgressOverlayController {
             backing: .buffered,
             defer: false
         )
+        let glass = GlassView(frame: CGRect(x: 0, y: 0, width: thumbnailView.bounds.width, height: 32))
+        glass.autoresizingMask = [.width, .maxYMargin]
+        thumbnailView.autoresizingMask = [.width, .height]
         thumbnailWindow.contentView = thumbnailView
+        thumbnailView.addSubview(glass)
         thumbnailWindow.backgroundColor = .clear
         thumbnailWindow.isOpaque = false
-        thumbnailWindow.ignoresMouseEvents = true
+        thumbnailWindow.ignoresMouseEvents = false
         thumbnailWindow.level = .statusBar
         thumbnailWindow.isReleasedWhenClosed = false
         thumbnailWindow.hasShadow = true
         thumbnailWindow.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        finishButton.target = self
+        finishButton.action = #selector(finishClicked)
+        finishButton.frame = CGRect(x: 50, y: 4, width: 120, height: 28)
+        glass.addSubview(finishButton)
 
         borderView.onDoubleClick = { [weak self] in self?.onDoubleClickSelection?() }
     }
@@ -63,6 +83,7 @@ final class LongScreenshotProgressOverlayController {
     func updatePreview(image: NSImage, frameCount: Int) {
         guard !isClosed else { return }
         let size = thumbnailSize(for: image)
+        previewImage = image
         thumbnailWindow.setContentSize(size)
         thumbnailView.frame = CGRect(origin: .zero, size: size)
         thumbnailView.update(image: image, frameCount: frameCount)
@@ -85,8 +106,8 @@ final class LongScreenshotProgressOverlayController {
 
     private func restoreVisibleWindows() {
         guard !isClosed, !isCaptureHidden else { return }
-        borderWindow.orderFrontRegardless()
-        if isThumbnailVisible { thumbnailWindow.orderFrontRegardless() }
+        if !borderWindow.isVisible { borderWindow.orderFrontRegardless() }
+        if isThumbnailVisible && !thumbnailWindow.isVisible { thumbnailWindow.orderFrontRegardless() }
     }
 
     func avoid(frame: CGRect) {
@@ -97,6 +118,7 @@ final class LongScreenshotProgressOverlayController {
     func close() {
         guard !isClosed else { return }
         isClosed = true
+        onDoubleClickSelection = nil
         stopDoubleClickMonitor()
         borderWindow.orderOut(nil)
         thumbnailWindow.orderOut(nil)
@@ -163,7 +185,10 @@ final class LongScreenshotProgressOverlayController {
         stopDoubleClickMonitor()
         doubleClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: .leftMouseDown) { [weak self] event in
             guard let self, event.clickCount >= 2, self.isNearSelectionBorder(event.locationInWindow) else { return }
-            Task { @MainActor in self.onDoubleClickSelection?() }
+            Task { @MainActor in
+                guard !self.isClosed else { return }
+                self.onDoubleClickSelection?()
+            }
         }
     }
 
@@ -218,16 +243,14 @@ private final class LongScreenshotSelectionBorderView: NSView {
 }
 
 private final class LongScreenshotThumbnailView: NSView {
+    var statusText: String?
     private var image: NSImage?
     private var frameCount = 0
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
-        layer?.cornerRadius = 14
-        layer?.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(0.92).cgColor
-        layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.8).cgColor
-        layer?.borderWidth = 1
+        layer?.backgroundColor = NSColor.clear.cgColor
     }
 
     required init?(coder: NSCoder) {
@@ -243,12 +266,8 @@ private final class LongScreenshotThumbnailView: NSView {
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
 
-        let panelRect = bounds.insetBy(dx: 1, dy: 1)
-        NSColor.windowBackgroundColor.withAlphaComponent(0.94).setFill()
-        NSBezierPath(roundedRect: panelRect, xRadius: 14, yRadius: 14).fill()
-
-        let text = frameCount == 0 ? "等待截取第一段\n按 Esc 完成截图" : "已截取 \(frameCount) 段\n按 Esc 完成截图"
-        let labelHeight: CGFloat = 38
+        let text = statusText ?? (frameCount == 0 ? "等待截取第一段" : "已截取 \(frameCount) 段；可按 Esc 完成")
+        let labelHeight: CGFloat = 68
         let imageRect = CGRect(
             x: 10,
             y: 10 + labelHeight,
@@ -265,12 +284,12 @@ private final class LongScreenshotThumbnailView: NSView {
             NSBezierPath(roundedRect: imageRect, xRadius: 10, yRadius: 10).fill()
         }
 
-        let textRect = CGRect(x: 10, y: 8, width: bounds.width - 20, height: labelHeight)
+        let textRect = CGRect(x: 10, y: 32, width: bounds.width - 20, height: labelHeight - 24)
         let paragraphStyle = NSMutableParagraphStyle()
         paragraphStyle.alignment = .center
         let attributes: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 12, weight: .semibold),
-            .foregroundColor: NSColor.secondaryLabelColor,
+            .foregroundColor: NSColor.labelColor,
             .paragraphStyle: paragraphStyle
         ]
         text.draw(in: textRect, withAttributes: attributes)

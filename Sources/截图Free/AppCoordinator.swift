@@ -38,13 +38,24 @@ final class WeakBox<T: AnyObject>: @unchecked Sendable {
 final class AppCoordinator: NSObject, NSMenuDelegate {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let settingsStore: SettingsStore
-    private let shortcutManager = ShortcutManager()
+    private var shortcutRegistrationFactory: () -> ShortcutRegistration = { ShortcutManager() }
+    private(set) lazy var shortcutBindings: ShortcutBindings = {
+        let bindings = ShortcutBindings(store: settingsStore, factory: shortcutRegistrationFactory, dispatch: { [weak self] action in
+            self?.dispatchShortcut(action)
+        })
+        bindings.onChange = { [weak self] in
+            guard let self, let menu = self.statusItem.menu else { return }
+            self.rebuildMenu(menu)
+        }
+        return bindings
+    }()
     private let captureService: ScreenCaptureService
     private let postLongScroll: ((Int32, CGPoint) -> Void)?
     private let canAutoScroll: () -> Bool
     private let menuPermissions: () -> MenuPermissionStatus
     private let onLongImage: ((NSImage) -> Void)?
     private var onLongError: ((Error) -> Void)?
+    private var stitchLongFrames: (([CGImage]) async throws -> CGImage)?
     private let systemScreenshotService = SystemScreenshotService()
     private lazy var longScreenshotService = LongScreenshotService(screenshotService: systemScreenshotService)
     private var overlayController: CaptureOverlayController?
@@ -61,24 +72,36 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
     private(set) var pinnedWindows: [PinWindowController] = []
     private var isLongCaptureRunning = false
     private var longCaptureTask: Task<Void, Never>?
+    private var longCaptureFinishTask: Task<Void, Never>?
     private var manualLongCaptureRect: CGRect?
-    private var manualLongCaptureFrames: [CGImage] = []
+    private var manualLongCapturePlan = LongScreenshotService.StitchPlan()
+    private var manualLongCaptureFrames: [StoredCaptureFrame] { manualLongCapturePlan.frames }
     private var isManualLongCaptureCapturing = false
     private var longCaptureScrollMonitor: Any?
+    private var longCaptureLocalScrollMonitor: Any?
+    private var scrollNeedsCapture = false
+    private var scrollGestureInSelection = false
     private var pendingScrollCapture: DispatchWorkItem?
     private var pendingLongCaptureDirection: LongScreenshotAppendDirection = .down
     private var automaticLongCaptureTask: Task<Void, Never>?
     private var automaticLongCaptureStableFrameCount = 0
+    private var manualSamplingTask: Task<Void, Never>?
+    private var overlapRetryCount = 0
+    private var automaticNeedsScroll = true
+    private let enableScrollMonitors: Bool
     private var longCaptureKeyMonitor: Any?
     private var longCaptureLocalKeyMonitor: Any?
     private var longCaptureMode: LongCaptureMode = .manual
     private var longCaptureSession = UUID()
     private var isLongCaptureFinishing = false
-    private var lastCapturedDirection: LongScreenshotAppendDirection?
+    // 恢复也会设置 finishing；只有显式完成请求可放弃未验证尾部。
+    private var longCaptureFinishRequested = false
+    private(set) var longCaptureLastNotice: String?
 
     override init() {
         captureService = ScreenCaptureService()
         postLongScroll = nil
+        enableScrollMonitors = true
         canAutoScroll = { AccessibilityPermissionChecker.isTrusted }
         menuPermissions = MenuPermissionStatus.current
         onLongImage = nil
@@ -91,19 +114,36 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
     // 注入捕获/滚动边界，回归测试不读取桌面、不向其他应用发送事件或保存用户数据。
     init(captureService: ScreenCaptureService, settingsStore: SettingsStore,
          postLongScroll: @escaping (Int32, CGPoint) -> Void,
-         onLongImage: @escaping (NSImage) -> Void, onLongError: ((Error) -> Void)? = nil,
-         menuPermissions: @escaping () -> MenuPermissionStatus = MenuPermissionStatus.current) {
+         onLongImage: ((NSImage) -> Void)?, onLongError: ((Error) -> Void)? = nil,
+         stitchLongFrames: (([CGImage]) async throws -> CGImage)? = nil,
+          menuPermissions: @escaping () -> MenuPermissionStatus = MenuPermissionStatus.current,
+           enableScrollMonitors: Bool = true,
+           shortcutRegistrationFactory: @escaping () -> ShortcutRegistration = { ShortcutManager() }) {
         self.captureService = captureService
         self.settingsStore = settingsStore
+        self.shortcutRegistrationFactory = shortcutRegistrationFactory
         self.postLongScroll = postLongScroll
+        self.enableScrollMonitors = enableScrollMonitors
         self.canAutoScroll = { true }
         self.menuPermissions = menuPermissions
         self.onLongImage = onLongImage
         self.onLongError = onLongError
+        self.stitchLongFrames = stitchLongFrames
         super.init()
     }
 
     var longCaptureIsRunning: Bool { isLongCaptureRunning }
+    var longCaptureProgressOverlay: LongScreenshotProgressOverlayController? { longScreenshotProgressOverlayController }
+    var longCaptureFrameCount: Int { manualLongCaptureFrames.count }
+    var retainedEditors: [AnnotationEditorController] { annotationEditorControllers }
+    var longCaptureResourcesAreReset: Bool {
+        !isLongCaptureRunning && !isLongCaptureFinishing && !isManualLongCaptureCapturing &&
+        longCaptureTask == nil && longCaptureFinishTask == nil && automaticLongCaptureTask == nil && manualSamplingTask == nil &&
+        longCaptureOverlayController == nil && longScreenshotProgressOverlayController == nil &&
+        manualLongCaptureRect == nil && manualLongCaptureFrames.isEmpty && pendingScrollCapture == nil &&
+        longCaptureScrollMonitor == nil && longCaptureLocalScrollMonitor == nil &&
+        !scrollNeedsCapture && longCaptureKeyMonitor == nil && longCaptureLocalKeyMonitor == nil
+    }
 
     func beginLongCapture(rect: CGRect, mode: LongCaptureMode) {
         guard !isLongCaptureRunning else { return }
@@ -119,13 +159,13 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
     }
 
     func stop() {
-        shortcutManager.unregister()
+        shortcutBindings.stop()
         cancelLongCapture()
         // 回调会移除数组元素，遍历快照以免跳过其他贴图。
         for controller in pinnedWindows { controller.close() }
     }
 
-    private func configureMenuBar() {
+    func configureMenuBar() {
         statusItem.button?.image = NSImage(systemSymbolName: "viewfinder", accessibilityDescription: "截图")
         statusItem.button?.image?.isTemplate = true
         statusItem.button?.toolTip = "截图Free"
@@ -141,12 +181,14 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
         let bundleID = bundle.bundleIdentifier ?? "unknown"
         let bundlePath = bundle.bundleURL.path
         let executablePath = bundle.executableURL?.path ?? "unknown"
-        AppLogger.log("runtime identity bundleID=\(bundleID) bundlePath=\(bundlePath) executable=\(executablePath) screenPreflight=\(ScreenPermissionChecker.canRecordScreen) accessibility=\(AccessibilityPermissionChecker.isTrusted)")
+        AppLogger.log("runtime identity bundleID=\(bundleID) version=\(bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") ?? "unknown") build=\(bundle.object(forInfoDictionaryKey: "CFBundleVersion") ?? "unknown") bundlePath=\(bundlePath) executable=\(executablePath) screenPreflight=\(ScreenPermissionChecker.canRecordScreen) accessibility=\(AccessibilityPermissionChecker.isTrusted) inputMonitoring=\(CGPreflightListenEventAccess())")
     }
 
     func menuWillOpen(_ menu: NSMenu) {
         rebuildMenu(menu)
     }
+
+    var mainStatusMenu: NSMenu? { statusItem.menu }
 
     private func rebuildMenu(_ menu: NSMenu) {
         let permissions = menuPermissions()
@@ -169,27 +211,45 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
         }
 
         if !menu.items.isEmpty { menu.addItem(NSMenuItem.separator()) }
-        let settings = settingsStore.load()
-        menu.addItem(NSMenuItem(title: "区域截图    \(shortcutManager.displayString(for: settings.captureShortcut))", action: #selector(startCaptureFromMenu), keyEquivalent: ""))
-        menu.addItem(NSMenuItem(title: "窗口截图    \(shortcutManager.displayString(for: .defaultWindowCapture))", action: #selector(startWindowCaptureFromMenu), keyEquivalent: ""))
-        menu.addItem(NSMenuItem(title: "全屏截图    \(shortcutManager.displayString(for: .defaultFullScreenCapture))", action: #selector(startFullScreenCaptureFromMenu), keyEquivalent: ""))
-        menu.addItem(NSMenuItem(title: "长截图自动滚动    \(shortcutManager.displayString(for: .defaultLongCapture))", action: #selector(startAutomaticLongCaptureFromMenu), keyEquivalent: ""))
-        menu.addItem(NSMenuItem(title: "长截图手动滚动", action: #selector(startManualLongCaptureFromMenu), keyEquivalent: ""))
-        menu.addItem(NSMenuItem(title: "录屏", action: #selector(startRecordingFromMenu), keyEquivalent: ""))
+        let selectors: [Selector] = [#selector(startCaptureFromMenu), #selector(startWindowCaptureFromMenu),
+            #selector(startFullScreenCaptureFromMenu), #selector(startAutomaticLongCaptureFromMenu),
+            #selector(startManualLongCaptureFromMenu), #selector(startRecordingFromMenu)]
+        for (action, selector) in zip(ShortcutAction.allCases, selectors) {
+            let shortcut = settingsStore.load().shortcut(for: action)
+            let equivalent = shortcut?.menuKeyEquivalent
+            let title = action.title + (shortcut != nil && equivalent == nil ? "    \(shortcut!.displayString)" : "")
+            let item = NSMenuItem(title: title, action: selector, keyEquivalent: equivalent ?? "")
+            item.keyEquivalentModifierMask = equivalent == nil ? [] : (shortcut?.modifierFlags ?? [])
+            menu.addItem(item)
+        }
         menu.addItem(NSMenuItem(title: "设置", action: #selector(showSettingsFromMenu), keyEquivalent: ","))
         menu.addItem(NSMenuItem.separator())
+        if isLongCaptureRunning {
+            menu.addItem(NSMenuItem(title: "完成当前长截图", action: #selector(finishLongCaptureFromMenu), keyEquivalent: ""))
+            menu.addItem(NSMenuItem(title: "取消当前长截图", action: #selector(cancelLongCaptureFromMenu), keyEquivalent: ""))
+        }
         menu.addItem(NSMenuItem(title: "退出", action: #selector(quitFromMenu), keyEquivalent: "q"))
         menu.items.forEach { $0.target = self }
     }
 
     private func registerShortcut() {
-        let settings = settingsStore.load()
-        shortcutManager.register(shortcuts: [
-            (settings.captureShortcut, { [weak self] in Task { @MainActor in self?.startCapture(kind: .area) } }),
-            (.defaultWindowCapture, { [weak self] in Task { @MainActor in self?.startCapture(kind: .window) } }),
-            (.defaultFullScreenCapture, { [weak self] in Task { @MainActor in self?.startCapture(kind: .fullScreen) } }),
-            (.defaultLongCapture, { [weak self] in Task { @MainActor in self?.startLongCapture(mode: .automatic) } })
-        ])
+        shortcutBindings.start()
+    }
+
+    private func dispatchShortcut(_ action: ShortcutAction) {
+        guard !shortcutBindings.isSuspended else { return }
+        // 快捷键只启动，不切换/结束会话，也不撤销其他捕获选区。
+        guard !isLongCaptureRunning, longCaptureOverlayController == nil,
+              recordingService == nil, recordingOverlayController == nil,
+              recordingOptionsWindowController == nil, overlayController == nil else { return }
+        switch action {
+        case .area: startCapture(kind: .area)
+        case .window: startCapture(kind: .window)
+        case .fullScreen: startCapture(kind: .fullScreen)
+        case .automaticLong: startLongCapture(mode: .automatic)
+        case .manualLong: startLongCapture(mode: .manual)
+        case .recording: startRecordingSelection()
+        }
     }
 
     @objc private func startCaptureFromMenu() {
@@ -238,7 +298,7 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
 
     @objc private func showSettingsFromMenu() {
         if settingsWindowController == nil {
-            settingsWindowController = SettingsWindowController(settingsStore: settingsStore)
+            settingsWindowController = SettingsWindowController(settingsStore: settingsStore, bindings: shortcutBindings)
         }
         settingsWindowController?.show()
     }
@@ -246,6 +306,9 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
     @objc private func quitFromMenu() {
         NSApplication.shared.terminate(nil)
     }
+
+    @objc private func finishLongCaptureFromMenu() { finishManualLongCapture() }
+    @objc private func cancelLongCaptureFromMenu() { cancelLongCapture() }
 
     private func startCapture(kind: ScreenshotKind = .area) {
         AppLogger.log("startCapture requested kind=\(kind)")
@@ -297,15 +360,17 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
         longCaptureMode = mode
         overlayController?.cancel()
         longCaptureOverlayController?.cancel()
-        var controller: CaptureOverlayController?
-        controller = CaptureOverlayController { [weak self] result in
+        let controllerBox = WeakBox<CaptureOverlayController>(nil)
+        let controller = CaptureOverlayController { [weak self] result in
             Task { @MainActor in
-                guard let self, let controller, self.longCaptureOverlayController === controller else { return }
+                guard let self, let controller = controllerBox.value,
+                      self.longCaptureOverlayController === controller else { return }
                 self.handleLongCaptureSelection(result)
             }
         }
+        controllerBox.value = controller
         longCaptureOverlayController = controller
-        controller?.start()
+        controller.start()
     }
 
     private func handleLongCaptureSelection(_ result: CaptureSelectionResult) {
@@ -314,27 +379,25 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
         guard case let .completed(rect) = result else { return }
 
         isLongCaptureRunning = true
+        longCaptureLastNotice = nil
         longCaptureSession = UUID()
         isLongCaptureFinishing = false
-        lastCapturedDirection = nil
         pendingLongCaptureDirection = .down
         let session = longCaptureSession
         manualLongCaptureRect = rect
-        manualLongCaptureFrames = []
+        manualLongCapturePlan = LongScreenshotService.StitchPlan()
         AppLogger.log("manual long screenshot started mode=\(longCaptureMode) rect=\(rect)")
+        startLongCaptureScrollMonitor()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
             guard let self, self.isLongCaptureRunning, !self.isLongCaptureFinishing,
                   self.longCaptureSession == session else { return }
             let progressOverlay = LongScreenshotProgressOverlayController(selectionRect: rect)
-            progressOverlay.onDoubleClickSelection = { [weak self] in
-                self?.stopAutomaticLongCapture()
-                self?.finishManualLongCapture()
-            }
+            progressOverlay.onDoubleClickSelection = self.longCaptureFinishAction(session: session)
             self.longScreenshotProgressOverlayController = progressOverlay
             progressOverlay.show()
-            self.startLongCaptureScrollMonitor()
             self.startLongCaptureKeyMonitor()
             self.captureManualLongFrame()
+            self.startManualSampling()
         }
     }
 
@@ -374,14 +437,16 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
         regionOverlay.show()
 
         let options = RecordingOptionsWindowController(selectionRect: rect)
-        options.onStart = { [weak self] audioSource, quality in
+        options.onStart = { [weak self, weak options] audioSource, quality in
             Task { @MainActor in
-                self?.recordingOptionsWindowController?.close()
-                self?.recordingOptionsWindowController = nil
-                await self?.prepareAndStartRecording(rect: rect, audioSource: audioSource, quality: quality)
+                guard let self, let options, self.recordingOptionsWindowController === options else { return }
+                options.close()
+                self.recordingOptionsWindowController = nil
+                await self.prepareAndStartRecording(rect: rect, audioSource: audioSource, quality: quality)
             }
         }
-        options.onCancel = { [weak self] in
+        options.onCancel = { [weak self, weak options] in
+            guard let options, self?.recordingOptionsWindowController === options else { return }
             self?.recordingOptionsWindowController?.close()
             self?.recordingOptionsWindowController = nil
             self?.recordingRegionOverlayController?.close()
@@ -410,8 +475,11 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
         do {
             _ = try await service.start(rect: rect, audioSource: audioSource, quality: quality)
             let control = RecordingControlWindowController(selectionRect: rect, audioSource: audioSource, quality: quality)
-            control.onStop = { [weak self] in
-                Task { @MainActor in await self?.finishRecording() }
+            control.onStop = { [weak self, weak service] in
+                Task { @MainActor in
+                    guard let service else { return }
+                    await self?.finishRecording(service: service)
+                }
             }
             recordingControlWindowController = control
             control.show()
@@ -425,8 +493,8 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
         }
     }
 
-    private func finishRecording() async {
-        guard let service = recordingService else { return }
+    private func finishRecording(service: ScreenRecordingService) async {
+        guard recordingService === service else { return }
         recordingControlWindowController?.close()
         recordingControlWindowController = nil
         recordingRegionOverlayController?.close()
@@ -455,30 +523,88 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
 
     private func startLongCaptureScrollMonitor() {
         stopLongCaptureScrollMonitor()
+        guard enableScrollMonitors else { return }
+        let session = longCaptureSession
         longCaptureScrollMonitor = NSEvent.addGlobalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
-            guard event.scrollingDeltaY != 0 else { return }
-            let point = NSEvent.mouseLocation
-            let direction: LongScreenshotAppendDirection = event.scrollingDeltaY > 0 ? .up : .down
             Task { @MainActor in
-                guard let self, self.manualLongCaptureRect?.contains(point) == true,
-                      self.longCaptureMode == .manual || self.automaticLongCaptureTask == nil else { return }
-                self.scheduleLongCaptureAfterScroll(direction: direction)
+                guard let self, self.longCaptureSession == session else { return }
+                self.handleLongCaptureScroll(event)
             }
         }
+        longCaptureLocalScrollMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
+            if let self, self.longCaptureSession == session { self.handleLongCaptureScroll(event) }
+            return event
+        }
+        AppLogger.log("long scroll monitors session=\(session) global=\(longCaptureScrollMonitor != nil) local=\(longCaptureLocalScrollMonitor != nil)")
+    }
+
+    func handleLongCaptureScroll(_ event: NSEvent) {
+        // 使用事件自身的位置，而非异步处理时已经移走的鼠标位置。
+        let point: CGPoint
+        if let window = event.window {
+            point = window.convertPoint(toScreen: event.locationInWindow)
+        } else if let cg = event.cgEvent, let primary = CaptureDisplay.current().first {
+            point = CGPoint(x: cg.location.x, y: primary.frame.maxY - cg.location.y)
+        } else {
+            point = event.locationInWindow
+        }
+        handleLongCaptureScroll(deltaY: event.scrollingDeltaY, point: point,
+                                phase: event.phase, momentum: event.momentumPhase)
+    }
+
+    func handleLongCaptureScroll(deltaY: CGFloat, point: CGPoint, phase: NSEvent.Phase = [], momentum: NSEvent.Phase = []) {
+        guard isLongCaptureRunning, !isLongCaptureFinishing,
+              longCaptureMode == .manual || automaticLongCaptureTask == nil else { return }
+        let inside = manualLongCaptureRect?.contains(point) == true
+        if phase.contains(.began) { scrollGestureInSelection = inside }
+        guard inside || (scrollGestureInSelection && (!phase.isEmpty || !momentum.isEmpty)) else { return }
+        if deltaY != 0 || phase.contains(.ended) || momentum.contains(.ended) {
+            // delta 已由系统应用自然滚动设置；只作提示，最终顺序由像素匹配决定。
+            scheduleLongCaptureAfterScroll(direction: deltaY == 0 ? pendingLongCaptureDirection : (deltaY > 0 ? .up : .down))
+        }
+        if momentum.contains(.ended) || phase.contains(.cancelled) { scrollGestureInSelection = false }
     }
 
     private func stopLongCaptureScrollMonitor() {
         pendingScrollCapture?.cancel()
         pendingScrollCapture = nil
+        if let monitor = longCaptureLocalScrollMonitor {
+            NSEvent.removeMonitor(monitor)
+            longCaptureLocalScrollMonitor = nil
+        }
         if let longCaptureScrollMonitor {
             NSEvent.removeMonitor(longCaptureScrollMonitor)
             self.longCaptureScrollMonitor = nil
         }
     }
 
+    // 全局滚轮只是加速提示。无辅助功能/Input Monitoring、鼠标移出选区时仍采图。
+    // 完成一次捕获及匹配后才启动下一周期，不积压位图或定时回调；静态上限约 2Hz。
+    private func startManualSampling() {
+        guard manualSamplingTask == nil else { return }
+        let session = longCaptureSession
+        manualSamplingTask = Task { [weak self] in
+            while !Task.isCancelled {
+                do { try await Task.sleep(nanoseconds: 450_000_000) } catch { return }
+                guard let self, self.longCaptureSession == session,
+                      self.isLongCaptureRunning, !self.isLongCaptureFinishing else { return }
+                if self.automaticLongCaptureTask == nil {
+                    self.captureManualLongFrame()
+                    await self.longCaptureTask?.value
+                }
+            }
+        }
+    }
+
     func scheduleLongCaptureAfterScroll(direction: LongScreenshotAppendDirection) {
-        guard isLongCaptureRunning, !isLongCaptureFinishing, !manualLongCaptureFrames.isEmpty else { return }
+        guard isLongCaptureRunning, !isLongCaptureFinishing else { return }
+        guard automaticLongCaptureTask == nil else { return }
+        if !scrollNeedsCapture {
+            AppLogger.log("long scroll queued session=\(longCaptureSession) hint=\(direction) capturing=\(isManualLongCaptureCapturing) frames=\(manualLongCaptureFrames.count)")
+        }
+        scrollNeedsCapture = true
         pendingLongCaptureDirection = direction
+        guard !manualLongCaptureFrames.isEmpty else { return }
         // 节流而非尾沿防抖：持续滚动也必须采样，不能一直等到停止。
         guard pendingScrollCapture == nil else { return }
         let session = longCaptureSession
@@ -502,47 +628,55 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
         let appendDirection = direction ?? pendingLongCaptureDirection
         let session = longCaptureSession
         isManualLongCaptureCapturing = true
+        if !manualLongCaptureFrames.isEmpty { scrollNeedsCapture = false }
         pendingScrollCapture?.cancel()
         pendingScrollCapture = nil
         let service = captureService
         let frames = manualLongCaptureFrames
         let matcher = longScreenshotService
-        let lastDirection = lastCapturedDirection
+        let plan = manualLongCapturePlan
+        let excludedWindows = longScreenshotProgressOverlayController?.captureWindowIDs ?? []
         let coordinatorBox = WeakBox(self)
         AppLogger.log("manual long screenshot capture frame begin rect=\(rect)")
         longCaptureTask = Task.detached(priority: .userInitiated) {
             do {
-                await MainActor.run {
-                    guard let coordinator = coordinatorBox.value, coordinator.longCaptureSession == session else { return }
-                    coordinator.longScreenshotProgressOverlayController?.setSelectionBorderHidden(true)
-                }
-                try await Task.sleep(nanoseconds: 80_000_000)
-                let frame = try service.captureCGImage(rect: rect)
-                try matcher.validateBudget(frames: frames + [frame])
-                let edge = appendDirection == .down ? frames.last : frames.first
-                let duplicate = edge.map { matcher.imagesAreIdentical($0, frame) } ?? false
-                if !duplicate, let edge {
-                    if let lastDirection, lastDirection != appendDirection { throw LongScreenshotError.directionChanged }
-                    _ = try matcher.validatedOverlap(previous: appendDirection == .down ? edge : frame,
-                                                     current: appendDirection == .down ? frame : edge)
-                }
+                try Task.checkCancellation()
+                let frame = try service.captureCGImage(rect: rect, excludingWindowIDs: excludedWindows)
+                try Task.checkCancellation()
+                // 明确阶段生命周期：匹配临时解码与存储缓冲必须在预览分配前释放。
+                let merged = try autoreleasepool { try matcher.merging(frame: frame, into: plan) }
+                let duplicate = merged.frames.count == frames.count
+                let preview = duplicate ? nil : try matcher.stitch(plan: merged, maximumPreviewDimension: 840)
                 let coordinator = coordinatorBox.value
                 try Task.checkCancellation()
                 await MainActor.run {
                     guard let coordinator, coordinator.longCaptureSession == session, coordinator.isLongCaptureRunning else { return }
-                    coordinator.longScreenshotProgressOverlayController?.setSelectionBorderHidden(false)
+                    // 已完成的采帧任务先解除引用，错误/完成处理不得取消正在回调的任务。
+                    coordinator.longCaptureTask = nil
+                    defer {
+                        if coordinator.scrollNeedsCapture, !coordinator.isLongCaptureFinishing {
+                            coordinator.scheduleLongCaptureAfterScroll(direction: coordinator.pendingLongCaptureDirection)
+                        }
+                    }
+                    coordinator.overlapRetryCount = 0
                     if appendDirection == .down,
                        coordinator.automaticLongCaptureTask != nil,
                        duplicate {
                         coordinator.automaticLongCaptureStableFrameCount += 1
-                        AppLogger.log("manual long screenshot reached bottom stableCount=\(coordinator.automaticLongCaptureStableFrameCount)")
+                        AppLogger.log("long capture unchanged; bottom unconfirmed samples=\(coordinator.automaticLongCaptureStableFrameCount)")
                         coordinator.isManualLongCaptureCapturing = false
-                        coordinator.longScreenshotProgressOverlayController?.setSelectionBorderHidden(false)
-                        if coordinator.automaticLongCaptureStableFrameCount >= 3, !coordinator.isLongCaptureFinishing {
+                        if coordinator.automaticLongCaptureStableFrameCount >= 8, !coordinator.isLongCaptureFinishing {
                             coordinator.stopAutomaticLongCapture()
-                            coordinator.finishManualLongCapture()
+                            if frames.count > 1 {
+                                // 有可信位移且连续无新增：直接交付当前计划，不再重采引入动画尾帧。
+                                coordinator.finishVerifiedAutomaticCapture()
+                            } else {
+                                coordinator.manualSamplingTask?.cancel()
+                                coordinator.manualSamplingTask = nil
+                                coordinator.longScreenshotProgressOverlayController?.setStatus("页面未变化，可手动滚动或完成。")
+                            }
                         }
-                        coordinator.statusItem.button?.toolTip = "长截图检测到底中 \(coordinator.automaticLongCaptureStableFrameCount)/3"
+                        coordinator.statusItem.button?.toolTip = "页面未变化，尚未确认到底；可手动滚动或完成"
                         return
                     }
                     coordinator.automaticLongCaptureStableFrameCount = 0
@@ -550,21 +684,15 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
                         coordinator.isManualLongCaptureCapturing = false
                         return
                     }
-                    // 当前缓冲区只能从端点扩展；反向回滚不能当作新内容插入另一端。
-                    if edge != nil {
-                        coordinator.lastCapturedDirection = appendDirection
-                    }
-                    switch appendDirection {
-                    case .down:
-                        coordinator.manualLongCaptureFrames.append(frame)
-                    case .up:
-                        coordinator.manualLongCaptureFrames.insert(frame, at: 0)
-                    }
+                    coordinator.manualLongCapturePlan = merged
+                    coordinator.automaticNeedsScroll = true
+                    coordinator.longScreenshotProgressOverlayController?.setStatus(nil)
                     coordinator.isManualLongCaptureCapturing = false
                     let frameCount = coordinator.manualLongCaptureFrames.count
                     AppLogger.log("manual long screenshot captured frame=\(frameCount) direction=\(appendDirection) size=\(frame.width)x\(frame.height)")
-                    coordinator.updateManualLongCapturePreview()
-                    coordinator.longScreenshotProgressOverlayController?.setSelectionBorderHidden(false)
+                    if let preview {
+                        coordinator.longScreenshotProgressOverlayController?.updatePreview(image: preview, frameCount: frameCount)
+                    }
                     coordinator.statusItem.button?.toolTip = "长截图已截取 \(frameCount) 段"
                     if frameCount == 1, coordinator.longCaptureMode == .automatic, !coordinator.isLongCaptureFinishing {
                         coordinator.startAutomaticManualLongCapture()
@@ -574,10 +702,26 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
                 let coordinator = coordinatorBox.value
                 await MainActor.run {
                     guard let coordinator, coordinator.longCaptureSession == session else { return }
-                    coordinator.resetLongCaptureState(closeControls: true)
+                    coordinator.longCaptureTask = nil
+                    coordinator.isManualLongCaptureCapturing = false
                     AppLogger.log("manual long screenshot capture failed: \(error.localizedDescription)")
-                    if let onError = coordinator.onLongError { onError(error) }
-                    else { coordinator.showTransientNotification("长截图失败", detail: error.localizedDescription) }
+                    if case LongScreenshotError.untrustedOverlap = error,
+                       coordinator.longCaptureFinishRequested, !frames.isEmpty {
+                        // 包括点击完成时仍在途的采样。保留原计划，交由完成任务
+                        // 正常渲染；不能把捕获、存储或渲染失败当作尾帧不匹配。
+                         AppLogger.log("long explicit finish retained validated frames=\(frames.count); rejected untrusted tail")
+                         coordinator.longCaptureLastNotice = "已按当前内容结束，尾部未确认。"
+                         return
+                    }
+                    if case LongScreenshotError.untrustedOverlap = error, !frames.isEmpty,
+                       !coordinator.isLongCaptureFinishing {
+                        coordinator.overlapRetryCount += 1
+                        coordinator.automaticNeedsScroll = false
+                        coordinator.longScreenshotProgressOverlayController?.setStatus("正在重采，请暂停滚动。")
+                        AppLogger.log("long overlap retry session=\(session) attempt=\(coordinator.overlapRetryCount)/6 retained=\(frames.count)")
+                        if coordinator.overlapRetryCount < 6 { return }
+                    }
+                    coordinator.failLongCapture(error)
                 }
             }
         }
@@ -589,13 +733,23 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
             return
         }
         automaticLongCaptureStableFrameCount = 0
+        automaticNeedsScroll = true
         AppLogger.log("manual long screenshot auto scroll started")
+        let session = longCaptureSession
         automaticLongCaptureTask = Task { [weak self] in
             while !Task.isCancelled {
-                guard let self, self.isLongCaptureRunning, !self.isLongCaptureFinishing else { return }
-                self.scrollLongCaptureArea(direction: .down)
-                do { try await Task.sleep(nanoseconds: 520_000_000) } catch { return }
-                guard !Task.isCancelled, !self.isLongCaptureFinishing else { return }
+                guard let self, self.longCaptureSession == session, self.isLongCaptureRunning, !self.isLongCaptureFinishing else { return }
+                await self.longCaptureTask?.value
+                guard !Task.isCancelled, self.longCaptureSession == session, !self.isLongCaptureFinishing else { return }
+                if self.automaticNeedsScroll {
+                    self.automaticNeedsScroll = false
+                    do { try await self.scrollLongCaptureArea(direction: .down) }
+                    catch is CancellationError { return }
+                    catch { self.failLongCapture(error); return }
+                }
+                // 未确认本次位移前只重新采样，不能越滚越远丢失重叠。
+                do { try await Task.sleep(nanoseconds: 300_000_000) } catch { return }
+                guard !Task.isCancelled, self.longCaptureSession == session, !self.isLongCaptureFinishing else { return }
                 self.captureManualLongFrame(direction: .down)
                 await self.longCaptureTask?.value
                 do { try await Task.sleep(nanoseconds: 120_000_000) } catch { return }
@@ -610,40 +764,40 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
         automaticLongCaptureStableFrameCount = 0
     }
 
-    private func scrollLongCaptureArea(direction: LongScreenshotAppendDirection) {
+    private func scrollLongCaptureArea(direction: LongScreenshotAppendDirection) async throws {
         guard let rect = manualLongCaptureRect else { return }
+        // 滚轮事件使用选区逻辑高度，不能把 Retina 位图高度再当作事件距离。
+        // 实际内容位移由匹配器逐像素求解，不假设事件 delta 等于截图像素位移。
         let step = LongScreenshotService.scrollStep(height: rect.height)
         let delta: Int32 = direction == .down ? -step : step
+        AppLogger.log("long scroll requested logicalHeight=\(rect.height) delta=\(delta) framePixels=\(manualLongCaptureFrames.last?.height ?? 0)")
         let location = manualLongCaptureRect.map { quartzScreenPoint(for: CGPoint(x: $0.midX, y: $0.midY)) }
-        if let postLongScroll, let location {
-            postLongScroll(delta, location)
-            return
-        }
-        guard let event = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 1, wheel1: delta, wheel2: 0, wheel3: 0) else {
-            return
-        }
-        if let location {
+        try await SmoothScroll.run(delta: delta) { segment in
+            guard let location else { throw ScreenCaptureError.failed }
+            if let postLongScroll { postLongScroll(segment, location); return }
+            guard let event = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 1, wheel1: segment, wheel2: 0, wheel3: 0) else {
+                throw ScreenCaptureError.failed
+            }
             event.location = location
+            event.post(tap: .cghidEventTap)
         }
-        event.post(tap: .cghidEventTap)
     }
 
     private func startLongCaptureKeyMonitor() {
         stopLongCaptureKeyMonitor()
+        let finish = longCaptureFinishAction(session: longCaptureSession)
         longCaptureKeyMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard event.keyCode == 53 else { return }
             Task { @MainActor in
-                guard let self, self.isLongCaptureRunning else { return }
-                self.stopAutomaticLongCapture()
-                self.finishManualLongCapture()
+                guard self != nil else { return }
+                finish()
             }
         }
         longCaptureLocalKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard event.keyCode == 53 else { return event }
             Task { @MainActor in
-                guard let self, self.isLongCaptureRunning else { return }
-                self.stopAutomaticLongCapture()
-                self.finishManualLongCapture()
+                guard self != nil else { return }
+                finish()
             }
             return nil
         }
@@ -675,14 +829,25 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
         )
     }
 
+    private func longCaptureFinishAction(session: UUID) -> () -> Void {
+        { [weak self] in
+            guard let self, self.longCaptureSession == session else { return }
+            self.finishManualLongCapture()
+        }
+    }
+
     func finishManualLongCapture() {
         guard isLongCaptureRunning, !isLongCaptureFinishing else { return }
+        longCaptureFinishRequested = true
         isLongCaptureFinishing = true
+        manualSamplingTask?.cancel()
+        manualSamplingTask = nil
         stopAutomaticLongCapture()
         stopLongCaptureScrollMonitor()
+        stopLongCaptureKeyMonitor()
         let session = longCaptureSession
         let inFlight = longCaptureTask
-        Task { [weak self] in
+        longCaptureFinishTask = Task { [weak self] in
             await inFlight?.value
             guard let self, self.longCaptureSession == session, self.isLongCaptureRunning else { return }
             // 停止滚动后再取一次尾帧，包括自动滚动等待中按 Esc 的情况。
@@ -695,87 +860,146 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
         }
     }
 
+    private func finishVerifiedAutomaticCapture() {
+        guard isLongCaptureRunning, !isLongCaptureFinishing else { return }
+        // 自动无新增不是用户放弃尾部，不能设置 explicit finish 标记。
+        isLongCaptureFinishing = true
+        manualSamplingTask?.cancel()
+        manualSamplingTask = nil
+        stopLongCaptureScrollMonitor()
+        stopLongCaptureKeyMonitor()
+        AppLogger.log("long automatic stop reason=verified-no-new-content frames=\(manualLongCaptureFrames.count); pageBottom=unconfirmed")
+        longCaptureFinishTask = Task { [weak self] in await self?.completeManualLongCapture() }
+    }
+
     private func completeManualLongCapture() async {
         let session = longCaptureSession
         let frames = manualLongCaptureFrames
+        let plan = manualLongCapturePlan
         let service = longScreenshotService
         do {
-            let bitmap = try await Task.detached(priority: .userInitiated) {
-                let image = try service.stitch(frames: frames)
-                guard let bitmap = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
-                    throw LongScreenshotError.noFramesCaptured
-                }
-                return bitmap
-            }.value
+            guard !frames.isEmpty else { throw LongScreenshotError.noFramesCaptured }
+            let bitmap: CGImage
+            if let stitchLongFrames {
+                bitmap = try await stitchLongFrames(frames.map { try $0.load() })
+            } else {
+                bitmap = try await Task.detached(priority: .userInitiated) {
+                    let image = try service.stitch(plan: plan)
+                    guard let bitmap = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+                        throw LongScreenshotError.noFramesCaptured
+                    }
+                    return bitmap
+                }.value
+            }
             guard longCaptureSession == session, isLongCaptureRunning else { return }
             let image = NSImage(cgImage: bitmap, size: CGSize(width: bitmap.width, height: bitmap.height))
             AppLogger.log("manual long screenshot finished frames=\(manualLongCaptureFrames.count) size=\(image.size)")
+            let notice = longCaptureLastNotice
+            longCaptureFinishTask = nil
             resetLongCaptureState(closeControls: true)
             if let onLongImage { onLongImage(image) } else { edit(image: image, allowsZoom: true) }
+            if let notice, onLongImage == nil { showLongCaptureNotice(notice) }
         } catch {
             guard longCaptureSession == session else { return }
             AppLogger.log("manual long screenshot stitch failed: \(error.localizedDescription)")
-            resetLongCaptureState(closeControls: true)
-            showTransientNotification("长截图失败", detail: error.localizedDescription)
+            longCaptureFinishTask = nil
+            failLongCapture(error)
         }
     }
 
-    private func updateManualLongCapturePreview() {
-        guard let frame = manualLongCaptureFrames.last else { return }
-        let image = NSImage(cgImage: frame, size: CGSize(width: frame.width, height: frame.height))
-        longScreenshotProgressOverlayController?.updatePreview(image: image, frameCount: manualLongCaptureFrames.count)
-    }
-
-    private func startDiagnosticLongCapture(rect: CGRect) {
-        let service = captureService
-        let coordinatorBox = WeakBox(self)
-        AppLogger.log("diagnostic long screenshot task scheduled rect=\(rect)")
-        longCaptureTask = Task.detached(priority: .userInitiated) {
-            do {
-                AppLogger.log("diagnostic long screenshot captureRegion begin rect=\(rect)")
-                let cgImage = try service.captureCGImage(rect: rect)
-                let coordinator = coordinatorBox.value
-                await MainActor.run {
-                    guard let coordinator else { return }
-                    let image = NSImage(cgImage: cgImage, size: rect.size)
-                    AppLogger.log("diagnostic long screenshot captureRegion succeeded size=\(image.size)")
-                    coordinator.resetLongCaptureState(closeControls: true)
-                    coordinator.edit(image: image, allowsZoom: true)
-                }
-            } catch {
-                let coordinator = coordinatorBox.value
-                await MainActor.run {
-                    coordinator?.resetLongCaptureState(closeControls: true)
-                    AppLogger.log("diagnostic long screenshot captureRegion failed: \(error.localizedDescription)")
-                    coordinator?.showTransientNotification("长截图失败", detail: error.localizedDescription)
-                }
+    private func failLongCapture(_ error: Error) {
+        // 优先交付已验证的连续长图，而不是把成功的拼接拆散成多张截图。
+        let frames = manualLongCaptureFrames
+        let plan = manualLongCapturePlan
+        let service = longScreenshotService
+        resetLongCaptureState(closeControls: true)
+        let recoverySession = longCaptureSession
+        isLongCaptureRunning = true
+        isLongCaptureFinishing = true
+        AppLogger.log("long screenshot recovery originalFrames=\(frames.count) error=\(error.localizedDescription)")
+        longCaptureFinishTask = Task { [self] in
+            let partial = await Task.detached(priority: .utility) { () -> CGImage? in
+                guard let image = try? service.stitch(plan: plan) else { return nil }
+                return image.cgImage(forProposedRect: nil, context: nil, hints: nil)
+            }.value
+            guard !Task.isCancelled, longCaptureSession == recoverySession else { return }
+            longCaptureFinishTask = nil
+            if partial == nil, !frames.isEmpty {
+                // 渲染失败不销毁唯一磁盘快照；保留会话，可重试完成或明确取消。
+                manualLongCapturePlan = plan
+                isLongCaptureFinishing = false
+                AppLogger.log("long recovery retained_on_disk frames=\(frames.count) diskBytes=\(plan.diskBytes) rendered=false")
+                if let onLongError { onLongError(error) }
+                else { showLongCaptureNotice("暂未生成图片，已保留采集内容，可重试完成。") }
+                return
             }
+            resetLongCaptureState(closeControls: true)
+            // 不再在失败恢复中一次性解码全部历史帧。
+            let recovered = (partial.map { [$0] } ?? []).map { NSImage(cgImage: $0, size: CGSize(width: $0.width, height: $0.height)) }
+            for image in recovered {
+                if let onLongImage { onLongImage(image) } else { edit(image: image, allowsZoom: true) }
+            }
+            let notice = Self.longCaptureFailureNotice(error, hasImage: partial != nil)
+            longCaptureLastNotice = notice
+            if let onLongError { onLongError(error) }
+            else { showLongCaptureNotice(notice) }
         }
+    }
+
+    static func longCaptureFailureNotice(_ error: Error, hasImage: Bool) -> String {
+        let reason: String
+        switch error {
+        case LongScreenshotError.untrustedOverlap: reason = "尾部重叠未确认"
+        case LongScreenshotError.memoryLimit, LongScreenshotError.resourceLimit, LongScreenshotError.inputLimit: reason = "已达安全上限"
+        case ScreenCaptureError.screenRecordingPermissionRequired: reason = "请开启屏幕录制权限"
+        case let error as CocoaError where error.code == .fileWriteOutOfSpace: reason = "磁盘空间不足"
+        default: reason = "采集或生成图片失败"
+        }
+        return reason + (hasImage ? "，已保留连续内容，请检查尾部。" : "，未生成图片，请重试。")
+    }
+
+    private func showLongCaptureNotice(_ notice: String) {
+        longCaptureLastNotice = notice
+        statusItem.button?.toolTip = notice
+        showTransientNotification("长截图", detail: notice)
     }
 
     func cancelLongCapture() {
         AppLogger.log("long screenshot cancelled")
-        stopAutomaticLongCapture()
-        longCaptureTask?.cancel()
         resetLongCaptureState(closeControls: true)
     }
 
     private func resetLongCaptureState(closeControls: Bool) {
+        AppLogger.log("long screenshot reset session=\(longCaptureSession) frames=\(manualLongCaptureFrames.count)")
         longCaptureSession = UUID()
+        manualSamplingTask?.cancel()
+        manualSamplingTask = nil
+        overlapRetryCount = 0
+        automaticNeedsScroll = true
+        longCaptureFinishRequested = false
         isLongCaptureFinishing = false
         isLongCaptureRunning = false
         longCaptureTask?.cancel()
         longCaptureTask = nil
+        longCaptureFinishTask?.cancel()
+        longCaptureFinishTask = nil
         stopAutomaticLongCapture()
         stopLongCaptureScrollMonitor()
         stopLongCaptureKeyMonitor()
         manualLongCaptureRect = nil
-        manualLongCaptureFrames = []
+        manualLongCapturePlan = LongScreenshotService.StitchPlan()
+        pendingLongCaptureDirection = .down
+        scrollNeedsCapture = false
+        scrollGestureInSelection = false
         isManualLongCaptureCapturing = false
         statusItem.button?.toolTip = "截图Free"
         if closeControls {
-            longScreenshotProgressOverlayController?.close()
+            let selection = longCaptureOverlayController
+            longCaptureOverlayController = nil
+            let progress = longScreenshotProgressOverlayController
             longScreenshotProgressOverlayController = nil
+            selection?.cancel()
+            progress?.close()
         }
     }
 
