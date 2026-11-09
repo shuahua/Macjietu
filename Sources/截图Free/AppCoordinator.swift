@@ -38,6 +38,18 @@ final class WeakBox<T: AnyObject>: @unchecked Sendable {
 final class AppCoordinator: NSObject, NSMenuDelegate {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let settingsStore: SettingsStore
+    private(set) lazy var screenshotShelf: ScreenshotShelfController = {
+        let shelf = ScreenshotShelfController()
+        shelf.onPin = { [weak self] image, frame in self?.pin(image: image, displayFrame: frame) ?? false }
+        shelf.onEdit = { [weak self] id, image in self?.editShelf(id: id, image: image) }
+        shelf.observe(settingsStore)
+        return shelf
+    }()
+    private lazy var clipboard: ClipboardService = {
+        let service = ClipboardService()
+        service.observeSettings(settingsStore)
+        return service
+    }()
     private var shortcutRegistrationFactory: () -> ShortcutRegistration = { ShortcutManager() }
     private(set) lazy var shortcutBindings: ShortcutBindings = {
         let bindings = ShortcutBindings(store: settingsStore, factory: shortcutRegistrationFactory, dispatch: { [weak self] action in
@@ -152,6 +164,7 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
     }
 
     func start() {
+        _ = screenshotShelf
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
         logRuntimeIdentity()
         configureMenuBar()
@@ -159,6 +172,7 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
     }
 
     func stop() {
+        screenshotShelf.setEnabled(false)
         shortcutBindings.stop()
         cancelLongCapture()
         // 回调会移除数组元素，遍历快照以免跳过其他贴图。
@@ -223,6 +237,15 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
             menu.addItem(item)
         }
         menu.addItem(NSMenuItem(title: "设置", action: #selector(showSettingsFromMenu), keyEquivalent: ","))
+        let shelfToggle = NSMenuItem(title: screenshotShelf.visible ? "隐藏截图架" : "显示截图架", action: #selector(toggleShelf), keyEquivalent: "")
+        let shelfShortcut = settingsStore.load().shortcut(for: .shelf)
+        shelfToggle.keyEquivalent = shelfShortcut?.menuKeyEquivalent ?? ""
+        shelfToggle.keyEquivalentModifierMask = shelfShortcut?.modifierFlags ?? []
+        shelfToggle.isEnabled = screenshotShelf.enabled && !screenshotShelf.model.items.isEmpty
+        menu.addItem(shelfToggle)
+        let shelfClear = NSMenuItem(title: "清空截图架", action: #selector(clearShelf), keyEquivalent: "")
+        shelfClear.isEnabled = screenshotShelf.enabled && !screenshotShelf.model.items.isEmpty
+        menu.addItem(shelfClear)
         menu.addItem(NSMenuItem.separator())
         if isLongCaptureRunning {
             menu.addItem(NSMenuItem(title: "完成当前长截图", action: #selector(finishLongCaptureFromMenu), keyEquivalent: ""))
@@ -249,12 +272,20 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
         case .automaticLong: startLongCapture(mode: .automatic)
         case .manualLong: startLongCapture(mode: .manual)
         case .recording: startRecordingSelection()
+        case .shelf: toggleShelf()
         }
     }
 
     @objc private func startCaptureFromMenu() {
         startCapture(kind: .area)
     }
+
+    @objc private func toggleShelf() {
+        if screenshotShelf.visible {
+            screenshotShelf.beginClosing(now: ProcessInfo.processInfo.systemUptime, reduceMotion: NSWorkspace.shared.accessibilityDisplayShouldReduceMotion)
+        } else { screenshotShelf.show() }
+    }
+    @objc private func clearShelf() { screenshotShelf.clear() }
 
     @objc private func startWindowCaptureFromMenu() {
         startCapture(kind: .window)
@@ -311,8 +342,10 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
     @objc private func cancelLongCaptureFromMenu() { cancelLongCapture() }
 
     private func startCapture(kind: ScreenshotKind = .area) {
+        screenshotShelf.suspended = true
         AppLogger.log("startCapture requested kind=\(kind)")
         Task {
+            defer { screenshotShelf.suspended = false }
             do {
                 let image: NSImage
                 switch kind {
@@ -352,6 +385,7 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
     }
 
     private func startLongCapture(mode: LongCaptureMode) {
+        screenshotShelf.suspended = true
         guard !isLongCaptureRunning else {
             showTransientNotification("长截图进行中", detail: "请等待当前长截图完成。")
             return
@@ -376,7 +410,8 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
     private func handleLongCaptureSelection(_ result: CaptureSelectionResult) {
         AppLogger.log("handleLongCaptureSelection \(result)")
         longCaptureOverlayController = nil
-        guard case let .completed(rect) = result else { return }
+        guard case let .completed(rect) = result else { screenshotShelf.suspended = false; return }
+        screenshotShelf.suspended = true
 
         isLongCaptureRunning = true
         longCaptureLastNotice = nil
@@ -393,6 +428,8 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
                   self.longCaptureSession == session else { return }
             let progressOverlay = LongScreenshotProgressOverlayController(selectionRect: rect)
             progressOverlay.onDoubleClickSelection = self.longCaptureFinishAction(session: session)
+            progressOverlay.onAutomaticToggle = { [weak self] in self?.toggleAutomaticLongCapture() }
+            progressOverlay.setAutomaticScrollState(isRunning: false, available: false)
             self.longScreenshotProgressOverlayController = progressOverlay
             progressOverlay.show()
             self.startLongCaptureKeyMonitor()
@@ -620,7 +657,7 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
             }
         }
         pendingScrollCapture = workItem
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12, execute: workItem)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.10, execute: workItem)
     }
 
     private func captureManualLongFrame(direction: LongScreenshotAppendDirection? = nil) {
@@ -635,7 +672,7 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
         let frames = manualLongCaptureFrames
         let matcher = longScreenshotService
         let plan = manualLongCapturePlan
-        let excludedWindows = longScreenshotProgressOverlayController?.captureWindowIDs ?? []
+        let excludedWindows = (longScreenshotProgressOverlayController?.captureWindowIDs ?? []).union(screenshotShelf.windowIDs)
         let coordinatorBox = WeakBox(self)
         AppLogger.log("manual long screenshot capture frame begin rect=\(rect)")
         longCaptureTask = Task.detached(priority: .userInitiated) {
@@ -667,6 +704,10 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
                         coordinator.isManualLongCaptureCapturing = false
                         if coordinator.automaticLongCaptureStableFrameCount >= 8, !coordinator.isLongCaptureFinishing {
                             coordinator.stopAutomaticLongCapture()
+                            coordinator.longScreenshotProgressOverlayController?.setAutomaticScrollState(
+                                isRunning: false,
+                                available: coordinator.canAutoScroll()
+                            )
                             if frames.count > 1 {
                                 // 有可信位移且连续无新增：直接交付当前计划，不再重采引入动画尾帧。
                                 coordinator.finishVerifiedAutomaticCapture()
@@ -690,6 +731,10 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
                     coordinator.isManualLongCaptureCapturing = false
                     let frameCount = coordinator.manualLongCaptureFrames.count
                     AppLogger.log("manual long screenshot captured frame=\(frameCount) direction=\(appendDirection) size=\(frame.width)x\(frame.height)")
+                    coordinator.longScreenshotProgressOverlayController?.setAutomaticScrollState(
+                        isRunning: coordinator.automaticLongCaptureTask != nil,
+                        available: coordinator.canAutoScroll()
+                    )
                     if let preview {
                         coordinator.longScreenshotProgressOverlayController?.updatePreview(image: preview, frameCount: frameCount)
                     }
@@ -729,12 +774,19 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
 
     private func startAutomaticManualLongCapture() {
         guard canAutoScroll() else {
+            longScreenshotProgressOverlayController?.setAutomaticScrollState(isRunning: false, available: false)
             showTransientNotification("需要辅助功能权限", detail: "自动滚动需要辅助功能权限。未授权时请继续手动滚动。")
+            return
+        }
+        guard !manualLongCaptureFrames.isEmpty else {
+            longScreenshotProgressOverlayController?.setStatus("正在截取首段，请稍候。")
             return
         }
         automaticLongCaptureStableFrameCount = 0
         automaticNeedsScroll = true
         AppLogger.log("manual long screenshot auto scroll started")
+        longScreenshotProgressOverlayController?.setAutomaticScrollState(isRunning: true, available: true)
+        longScreenshotProgressOverlayController?.setStatus(nil)
         let session = longCaptureSession
         automaticLongCaptureTask = Task { [weak self] in
             while !Task.isCancelled {
@@ -754,6 +806,23 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
                 await self.longCaptureTask?.value
                 do { try await Task.sleep(nanoseconds: 120_000_000) } catch { return }
             }
+        }
+    }
+
+    private func toggleAutomaticLongCapture() {
+        guard isLongCaptureRunning, !isLongCaptureFinishing else { return }
+        guard !manualLongCaptureFrames.isEmpty else {
+            longScreenshotProgressOverlayController?.setStatus("正在截取首段，请稍候。")
+            return
+        }
+        if automaticLongCaptureTask != nil {
+            stopAutomaticLongCapture()
+            automaticNeedsScroll = true
+            longScreenshotProgressOverlayController?.setAutomaticScrollState(isRunning: false, available: canAutoScroll())
+            longScreenshotProgressOverlayController?.setStatus("自动滚动已暂停；可手动滚动或继续。")
+            statusItem.button?.toolTip = "自动滚动已暂停；可手动滚动或继续"
+        } else {
+            startAutomaticManualLongCapture()
         }
     }
 
@@ -970,6 +1039,7 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
     }
 
     private func resetLongCaptureState(closeControls: Bool) {
+        screenshotShelf.suspended = false
         AppLogger.log("long screenshot reset session=\(longCaptureSession) frames=\(manualLongCaptureFrames.count)")
         longCaptureSession = UUID()
         manualSamplingTask?.cancel()
@@ -1009,7 +1079,8 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
         guard case let .completed(rect) = result else { return }
 
         do {
-            let image = try captureService.capture(rect: rect)
+            let cg = try captureService.captureCGImage(rect: rect, excludingWindowIDs: screenshotShelf.windowIDs)
+            let image = NSImage(cgImage: cg, size: rect.size)
             edit(image: image)
         } catch {
             AppLogger.log("capture failed: \(error.localizedDescription)")
@@ -1017,9 +1088,32 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
         }
     }
 
-    private func edit(image: NSImage, allowsZoom: Bool = false) {
+    private var shelfEditors: [UUID: AnnotationEditorController] = [:]
+    func editShelf(id: UUID, image: NSImage) {
+        NSApp.activate(ignoringOtherApps: true)
+        if let editor = shelfEditors[id], annotationEditorControllers.contains(where: { $0 === editor }) {
+            editor.show(); return
+        }
+        edit(image: image, shelfID: id)
+    }
+
+    func edit(image: NSImage, allowsZoom: Bool = false, shelfID: UUID? = nil) {
         let settings = settingsStore.load()
+        clipboard.automaticEnabled = settings.autoCopyAfterCapture
         let controller = AnnotationEditorController(image: image, exportScale: CGFloat(settings.exportScale), allowsZoom: allowsZoom)
+        let owner = controller.clipboardSessionID
+        let itemID = shelfID ?? owner
+        shelfEditors[itemID] = controller
+        if shelfID == nil { screenshotShelf.add(id: itemID, image: image) }
+        controller.onContentChange = { [weak self, weak controller] revision in
+            self?.clipboard.request(owner: owner, revision: revision) { [weak controller] in controller?.automaticCopySnapshot() }
+            self?.screenshotShelf.update(id: itemID) { [weak controller] in controller?.shelfSnapshot() }
+        }
+        controller.onClipboardClose = { [weak self, weak controller] in
+            self?.screenshotShelf.update(id: itemID, immediate: true) { [weak controller] in controller?.shelfSnapshot() }
+            self?.shelfEditors[itemID] = nil
+            self?.clipboard.close(owner: owner)
+        }
         controller.onComplete = { [weak self, weak controller] _ in
             guard let controller else { return }
             self?.annotationEditorControllers.removeAll { $0 === controller }
@@ -1028,7 +1122,13 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
             guard let controller else { return }
             self?.annotationEditorControllers.removeAll { $0 === controller }
         }
-        controller.onCopy = { image in ClipboardService.copy(image: image) }
+        controller.onCopy = { [weak self] image in
+            self?.clipboard.request(owner: owner, revision: 0, automatic: false) {
+                guard let cg = ImageEncoding.sourceCGImage(from: image) else { return nil }
+                let renderer = AnnotationRasterizer(source: cg, bounds: CGRect(origin: .zero, size: image.size), shapes: [], scale: 1)
+                return { try renderer.pngData() }
+            }
+        }
         controller.onSave = { [weak self] image in self?.save(image: image) ?? false }
         controller.onPin = { [weak self] image in self?.pin(image: image) }
         controller.onClose = { [weak self, weak controller] in
@@ -1037,15 +1137,7 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
         }
         annotationEditorControllers.append(controller)
         controller.show()
-        if settings.autoCopyAfterCapture {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak controller] in
-                guard let renderedImage = controller?.exportImage() else {
-                    ClipboardService.copy(image: image)
-                    return
-                }
-                ClipboardService.copy(image: renderedImage)
-            }
-        }
+        if shelfID == nil { clipboard.request(owner: owner, revision: 0) { [weak controller] in controller?.automaticCopySnapshot() } }
     }
 
     private func save(image: NSImage) -> Bool {
@@ -1067,14 +1159,15 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
         }
     }
 
-    func pin(image: NSImage) {
+    @discardableResult func pin(image: NSImage, displayFrame: CGRect? = nil) -> Bool {
         let controller = PinWindowController(image: image)
         controller.onClose = { [weak self, weak controller] in
             guard let controller else { return }
             self?.pinnedWindows.removeAll { $0 === controller }
         }
         pinnedWindows.append(controller)
-        controller.show()
+        controller.show(displayFrame: displayFrame)
+        return controller.window?.isVisible == true
     }
 
     private func showPermissionAlert() {

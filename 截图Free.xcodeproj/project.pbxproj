@@ -16,6 +16,8 @@
 		A00000000000000000000007 /* ScreenPermissionChecker.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000107 /* ScreenPermissionChecker.swift */; };
 		A00000000000000000000008 /* CaptureOverlayController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000108 /* CaptureOverlayController.swift */; };
 		A00000000000000000000009 /* ScreenCaptureService.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000109 /* ScreenCaptureService.swift */; };
+		F10000000000000000000001 /* ScreenshotShelf.swift in Sources */ = {isa = PBXBuildFile; fileRef = F10000000000000000000002; };
+		F10000000000000000000003 /* AnnotationRasterizer.swift in Sources */ = {isa = PBXBuildFile; fileRef = F10000000000000000000004; };
 		A0000000000000000000000B /* PinWindowController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0000000000000000000010B /* PinWindowController.swift */; };
 		A0000000000000000000000C /* ClipboardService.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0000000000000000000010C /* ClipboardService.swift */; };
 		A0000000000000000000000D /* ImageEncoding.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0000000000000000000010D /* ImageEncoding.swift */; };
@@ -52,6 +54,8 @@
 		A00000000000000000000107 /* ScreenPermissionChecker.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreenPermissionChecker.swift; sourceTree = "<group>"; };
 		A00000000000000000000108 /* CaptureOverlayController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CaptureOverlayController.swift; sourceTree = "<group>"; };
 		A00000000000000000000109 /* ScreenCaptureService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreenCaptureService.swift; sourceTree = "<group>"; };
+		F10000000000000000000002 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreenshotShelf.swift; sourceTree = "<group>"; };
+		F10000000000000000000004 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AnnotationRasterizer.swift; sourceTree = "<group>"; };
 		A0000000000000000000010B /* PinWindowController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PinWindowController.swift; sourceTree = "<group>"; };
 		A0000000000000000000010C /* ClipboardService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClipboardService.swift; sourceTree = "<group>"; };
 		A0000000000000000000010D /* ImageEncoding.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ImageEncoding.swift; sourceTree = "<group>"; };
@@ -144,6 +148,8 @@
 				A00000000000000000000107 /* ScreenPermissionChecker.swift */,
 				A00000000000000000000108 /* CaptureOverlayController.swift */,
 				A00000000000000000000109 /* ScreenCaptureService.swift */,
+				F10000000000000000000002 /* ScreenshotShelf.swift */,
+				F10000000000000000000004 /* AnnotationRasterizer.swift */,
 				A00000000000000000000111 /* SystemScreenshotService.swift */,
 				A0000000000000000000010B /* PinWindowController.swift */,
 				A0000000000000000000010C /* ClipboardService.swift */,
@@ -246,6 +252,8 @@
 				A00000000000000000000007 /* ScreenPermissionChecker.swift in Sources */,
 				A00000000000000000000008 /* CaptureOverlayController.swift in Sources */,
 				A00000000000000000000009 /* ScreenCaptureService.swift in Sources */,
+				F10000000000000000000001 /* ScreenshotShelf.swift in Sources */,
+				F10000000000000000000003 /* AnnotationRasterizer.swift in Sources */,
 				A00000000000000000000011 /* SystemScreenshotService.swift in Sources */,
 				A0000000000000000000000B /* PinWindowController.swift in Sources */,
 				A0000000000000000000000C /* ClipboardService.swift in Sources */,

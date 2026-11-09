@@ -48,7 +48,7 @@ final class WindowDecorationRegressionTests: XCTestCase {
         XCTAssertEqual(root.alphaValue, 1)
         XCTAssertTrue(root.hitTest(title.convert(NSPoint(x: title.bounds.midX, y: title.bounds.midY), to: root.superview)) === root)
         let controls = descendants(root).compactMap { $0 as? NSControl }.filter { $0 is NSButton || $0 is NSPopUpButton }
-        XCTAssertEqual(controls.count, 6)
+        XCTAssertEqual(controls.count, 7)
         for control in controls {
             let rect = control.convert(control.bounds, to: nil)
             XCTAssertLessThanOrEqual(rect.maxY, titleFrame.minY)

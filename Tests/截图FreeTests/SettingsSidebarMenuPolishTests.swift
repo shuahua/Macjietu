@@ -26,11 +26,11 @@ final class SettingsSidebarMenuPolishTests: XCTestCase {
         defer { coordinator.stop() }
         let menu = try XCTUnwrap(coordinator.mainStatusMenu)
         let selectors = ["startCaptureFromMenu", "startWindowCaptureFromMenu", "startFullScreenCaptureFromMenu",
-                         "startAutomaticLongCaptureFromMenu", "startManualLongCaptureFromMenu", "startRecordingFromMenu"]
+                         "startAutomaticLongCaptureFromMenu", "startManualLongCaptureFromMenu", "startRecordingFromMenu", "toggleShelf"]
         func verify(_ action: ShortcutAction, _ shortcut: Shortcut?) throws {
             let index = try XCTUnwrap(ShortcutAction.allCases.firstIndex(of: action))
             let item = try XCTUnwrap(menu.items.first { $0.action == NSSelectorFromString(selectors[index]) })
-            XCTAssertEqual(item.title, action.title)
+            XCTAssertEqual(item.title, action == .shelf ? "显示截图架" : action.title)
             XCTAssertTrue(item.target === coordinator)
             XCTAssertEqual(item.keyEquivalent, shortcut?.menuKeyEquivalent ?? "")
             XCTAssertEqual(item.keyEquivalentModifierMask, shortcut?.modifierFlags ?? [])

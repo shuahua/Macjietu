@@ -19,6 +19,22 @@ private final class FakeShortcutRegistration: ShortcutRegistration {
 
 @MainActor
 final class SettingsShortcutCustomizationTests: XCTestCase {
+    func testShelfMigrationDoesNotResetSixActionsOrExplicitClear() throws {
+        var old = AppSettings.defaults
+        old.setShortcut(nil, for: .window)
+        old.setShortcut(nil, for: .shelf)
+        var json = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(old)) as? [String: Any])
+        json.removeValue(forKey: "shortcutSchemaVersion")
+        let migrated = try JSONDecoder().decode(AppSettings.self, from: JSONSerialization.data(withJSONObject: json))
+        XCTAssertEqual(migrated.shortcut(for: .shelf), Shortcut(keyCode: 17, modifierFlags: [.control, .option]))
+        for action in ShortcutAction.allCases where action != .shelf { XCTAssertEqual(migrated.shortcut(for: action), old.shortcut(for: action)) }
+        var cleared = migrated; cleared.setShortcut(nil, for: .shelf)
+        XCTAssertNil(try JSONDecoder().decode(AppSettings.self, from: JSONEncoder().encode(cleared)).shortcut(for: .shelf))
+        old.setShortcut(ShortcutAction.shelf.legacyDefault, for: .recording)
+        json = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(old)) as? [String: Any])
+        json.removeValue(forKey: "shortcutSchemaVersion")
+        XCTAssertNil(try JSONDecoder().decode(AppSettings.self, from: JSONSerialization.data(withJSONObject: json)).shortcut(for: .shelf))
+    }
     private func store() -> SettingsStore { SettingsStore(fileURL: temporaryURL().appendingPathComponent("settings.json")) }
 
     func testLegacyMappingAndClearSurvivesRoundTrip() throws {
@@ -50,7 +66,7 @@ final class SettingsShortcutCustomizationTests: XCTestCase {
         bindings.start()
         let old = storage.load()
         XCTAssertNotNil(bindings.update(.defaultWindowCapture, for: .area))
-        XCTAssertEqual(fakes.count, 4)
+        XCTAssertEqual(fakes.count, 5)
         fail = true
         XCTAssertNotNil(bindings.update(Shortcut(keyCode: 17, modifierFlags: .option), for: .area))
         XCTAssertEqual(storage.load(), old)
@@ -89,14 +105,14 @@ final class SettingsShortcutCustomizationTests: XCTestCase {
         XCTAssertEqual(actions, ShortcutAction.allCases)
         bindings.suspend()
         first.forEach { $0.handler?() }
-        XCTAssertEqual(actions.count, 6)
+        XCTAssertEqual(actions.count, 7)
         XCTAssertTrue(first.allSatisfy(\.removed))
         bindings.resume()
         first.forEach { $0.handler?() }
-        XCTAssertEqual(actions.count, 6)
-        fakes.last?.handler?()
-        XCTAssertEqual(actions.last, .recording)
         XCTAssertEqual(actions.count, 7)
+        fakes.last?.handler?()
+        XCTAssertEqual(actions.last, .shelf)
+        XCTAssertEqual(actions.count, 8)
     }
 
     func testNavigationRecordingCancellationFocusAndPreciseAbout() throws {

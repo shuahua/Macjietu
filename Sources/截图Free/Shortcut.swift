@@ -116,7 +116,7 @@ struct Shortcut: Codable, Equatable {
 }
 
 enum ShortcutAction: String, CaseIterable, Codable {
-    case area, window, fullScreen, automaticLong, manualLong, recording
+    case area, window, fullScreen, automaticLong, manualLong, recording, shelf
     var title: String {
         switch self {
         case .area: "区域截图"
@@ -125,6 +125,7 @@ enum ShortcutAction: String, CaseIterable, Codable {
         case .automaticLong: "长截图自动滚动"
         case .manualLong: "长截图手动滚动"
         case .recording: "录屏"
+        case .shelf: "显示/隐藏截图架"
         }
     }
     var legacyDefault: Shortcut? {
@@ -134,6 +135,7 @@ enum ShortcutAction: String, CaseIterable, Codable {
         case .fullScreen: .defaultFullScreenCapture
         case .automaticLong: .defaultLongCapture
         case .manualLong, .recording: nil
+        case .shelf: Shortcut(keyCode: 17, modifierFlags: [.control, .option])
         }
     }
 }

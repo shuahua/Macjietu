@@ -13,8 +13,7 @@ final class AnnotationTextTests: XCTestCase {
 
     private func type(_ text: String, in canvas: AnnotationCanvasView) throws {
         let editor = try XCTUnwrap(canvas.subviews.compactMap { $0 as? NSTextView }.first)
-        editor.string = text
-        canvas.textDidChange(Notification(name: NSText.didChangeNotification, object: editor))
+        editor.insertText(text, replacementRange: NSRange(location: 0, length: (editor.string as NSString).length))
     }
 
     func testActualTextKitFrameFitsShortLongMultilineAndShrinks() throws {
@@ -44,7 +43,6 @@ final class AnnotationTextTests: XCTestCase {
         editor.setMarkedText("中文输入", selectedRange: NSRange(location: 2, length: 0), replacementRange: NSRange(location: NSNotFound, length: 0))
         let marked = editor.markedRange()
         let selection = editor.selectedRange()
-        view.textDidChange(Notification(name: NSText.didChangeNotification, object: editor))
         XCTAssertTrue(editor.hasMarkedText())
         XCTAssertEqual(editor.markedRange(), marked)
         XCTAssertEqual(editor.selectedRange(), selection)
@@ -71,7 +69,7 @@ final class AnnotationTextTests: XCTestCase {
         }
     }
 
-    func testSwitchToolPermanentlyFreezesText() throws {
+    func testSwitchToolCommitsWithoutReopeningContentEditor() throws {
         let view = canvas()
         view.beginText(at: CGPoint(x: 30, y: 250))
         try type("文字", in: view)
@@ -153,7 +151,7 @@ final class AnnotationTextTests: XCTestCase {
         XCTAssertEqual(view.shapes.count, 1)
     }
 
-    func testCanvasMouseCreatesSelectsAndDragsOnlySessionText() throws {
+    func testCanvasLongPressMovesSessionAndFixedText() throws {
         let view = canvas()
         let window = NSWindow(contentRect: view.bounds, styleMask: .borderless, backing: .buffered, defer: false)
         window.contentView = view
@@ -162,20 +160,143 @@ final class AnnotationTextTests: XCTestCase {
                                             windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1))
         }
         view.mouseDown(with: try event(.leftMouseDown, CGPoint(x: 30, y: 250)))
+        view.mouseUp(with: try event(.leftMouseUp, CGPoint(x: 30, y: 250)))
         try type("拖动", in: view)
         view.commitTextEditing()
         view.mouseDown(with: try event(.leftMouseDown, CGPoint(x: 32, y: 245)))
+        let pressed = expectation(description: "真实长按计时器触发")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { pressed.fulfill() }
+        wait(for: [pressed], timeout: 2)
         view.mouseDragged(with: try event(.leftMouseDragged, CGPoint(x: 52, y: 225)))
         view.mouseUp(with: try event(.leftMouseUp, CGPoint(x: 52, y: 225)))
         guard case let .text(_, origin, _, _, _, _, _) = view.editableTexts[0] else { return XCTFail() }
         XCTAssertEqual(origin, CGPoint(x: 50, y: 230))
         view.tool = .rectangle
-        view.tool = .text
+        view.tool = .none
+        let fixed = view.shapes
         view.mouseDown(with: try event(.leftMouseDown, CGPoint(x: 52, y: 225)))
-        let editor = try XCTUnwrap(view.subviews.first as? NSTextView)
-        XCTAssertTrue(editor.string.isEmpty)
+        let held = expectation(description: "固定文字也可长按")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { held.fulfill() }
+        wait(for: [held], timeout: 2)
+        view.mouseDragged(with: try event(.leftMouseDragged, CGPoint(x: 72, y: 205)))
+        view.mouseUp(with: try event(.leftMouseUp, CGPoint(x: 72, y: 205)))
+        XCTAssertNil(view.subviews.first as? NSTextView)
         XCTAssertEqual(view.shapes.count, 1)
+        XCTAssertNotEqual(view.shapes, fixed)
+        let moved = view.shapes
+        view.undoAnnotation()
+        XCTAssertEqual(view.shapes, fixed)
+        view.redoAnnotation()
+        XCTAssertEqual(view.shapes, moved)
+        view.mouseDown(with: try event(.leftMouseDown, CGPoint(x: 72, y: 205)))
+        let resize = expectation(description: "固定文字长按后保留字号手柄")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { resize.fulfill() }
+        wait(for: [resize], timeout: 2)
+        view.mouseUp(with: try event(.leftMouseUp, CGPoint(x: 72, y: 205)))
+        let handle = try XCTUnwrap(view.subviews.first)
+        handle.mouseDown(with: try event(.leftMouseDown, CGPoint(x: 100, y: 100)))
+        handle.mouseDragged(with: try event(.leftMouseDragged, CGPoint(x: 140, y: 100)))
+        handle.mouseUp(with: try event(.leftMouseUp, CGPoint(x: 140, y: 100)))
+        guard case let .text(_, _, _, resizedSize, _, _, _) = view.shapes[0] else { return XCTFail() }
+        XCTAssertEqual(resizedSize, 34)
+        view.undoAnnotation()
+        XCTAssertEqual(view.shapes, moved)
         view.dispose()
         window.contentView = nil
+    }
+
+    func testRealInputMarkedNewlineDeleteUndoFrameAndParameters() throws {
+        let view = canvas()
+        view.beginText(at: CGPoint(x: 30, y: 250))
+        let editor = try XCTUnwrap(view.subviews.first as? NSTextView)
+        let manager = try XCTUnwrap(editor.undoManager)
+        manager.groupsByEvent = false
+        let empty = editor.frame
+        manager.beginUndoGrouping()
+        editor.insertText("第一行较长文字\n第二行\n", replacementRange: NSRange(location: NSNotFound, length: 0))
+        manager.endUndoGrouping()
+        let grown = editor.frame
+        XCTAssertGreaterThan(grown.width, empty.width)
+        XCTAssertGreaterThan(grown.height, empty.height * 2)
+        manager.undo()
+        XCTAssertEqual(editor.string, "")
+        XCTAssertEqual(editor.frame.size, empty.size)
+        manager.redo()
+        XCTAssertEqual(editor.frame.size, grown.size)
+        editor.setSelectedRange(NSRange(location: 0, length: (editor.string as NSString).length))
+        manager.beginUndoGrouping()
+        editor.deleteBackward(nil)
+        manager.endUndoGrouping()
+        XCTAssertEqual(editor.frame.size, empty.size)
+        editor.setMarkedText("中文组合输入很长", selectedRange: NSRange(location: 2, length: 0), replacementRange: NSRange(location: NSNotFound, length: 0))
+        let long = editor.frame.width
+        editor.setMarkedText("中", selectedRange: NSRange(location: 1, length: 0), replacementRange: NSRange(location: NSNotFound, length: 0))
+        XCTAssertLessThan(editor.frame.width, long)
+        view.textPointSize = 32
+        view.strokeColor = .blue
+        XCTAssertTrue(editor.hasMarkedText())
+        XCTAssertTrue(view.subviews.contains { $0 === editor })
+        editor.unmarkText()
+        XCTAssertFalse(editor.hasMarkedText())
+        XCTAssertEqual(view.selectedTextIndex, 0)
+        XCTAssertGreaterThan(editor.frame.height, empty.height)
+    }
+
+    func testOneShotOutsideClickShortPressAndTimerCancellation() throws {
+        let view = canvas()
+        let window = NSWindow(contentRect: view.bounds, styleMask: .borderless, backing: .buffered, defer: false)
+        window.contentView = view
+        defer { view.dispose(); window.contentView = nil }
+        func send(_ type: NSEvent.EventType, _ point: CGPoint) throws {
+            let event = try XCTUnwrap(NSEvent.mouseEvent(with: type, location: point, modifierFlags: [], timestamp: 0,
+                windowNumber: window.windowNumber, context: nil, eventNumber: 1, clickCount: 1, pressure: 1))
+            switch type {
+            case .leftMouseDown: view.mouseDown(with: event)
+            case .leftMouseDragged: view.mouseDragged(with: event)
+            default: view.mouseUp(with: event)
+            }
+        }
+        let origin = CGPoint(x: 30, y: 250)
+        let outside = CGPoint(x: 260, y: 60)
+        try send(.leftMouseDown, origin)
+        try send(.leftMouseUp, origin)
+        try type("保留文字", in: view)
+        view.textPointSize = 24
+        view.strokeColor = .green
+        XCTAssertEqual(view.selectedTextIndex, 0)
+        try send(.leftMouseDown, outside)
+        try send(.leftMouseUp, outside)
+        XCTAssertNil(view.selectedTextIndex)
+        XCTAssertFalse(view.textCreationArmed)
+        try send(.leftMouseDown, outside)
+        try send(.leftMouseUp, outside)
+        XCTAssertEqual(view.shapes.count, 1)
+        XCTAssertEqual(view.tool, .none)
+        XCTAssertTrue(view.subviews.isEmpty)
+        let before = view.shapes
+        let hit = CGPoint(x: 32, y: 240)
+        try send(.leftMouseDown, hit)
+        try send(.leftMouseDragged, CGPoint(x: 60, y: 220))
+        try send(.leftMouseUp, hit)
+        XCTAssertEqual(view.shapes, before)
+        try send(.leftMouseDown, hit)
+        view.tool = .rectangle
+        let fixed = view.shapes
+        let cancelled = expectation(description: "松手和切工具后的延迟回调已取消")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { cancelled.fulfill() }
+        wait(for: [cancelled], timeout: 2)
+        XCTAssertTrue(view.subviews.isEmpty)
+        XCTAssertEqual(view.shapes, fixed)
+        view.tool = .text
+        try send(.leftMouseDown, outside)
+        try send(.leftMouseUp, outside)
+        XCTAssertNotNil(view.selectedTextIndex)
+        view.commitTextEditing()
+        try send(.leftMouseDown, hit)
+        view.dispose()
+        let disposed = expectation(description: "销毁后计时器不得新建控件")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { disposed.fulfill() }
+        wait(for: [disposed], timeout: 2)
+        XCTAssertTrue(view.subviews.isEmpty)
     }
 }

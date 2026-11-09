@@ -11,11 +11,14 @@ final class PinWindowController: NSObject, NSWindowDelegate {
         self.image = image
     }
 
-    func show() {
+    func show(displayFrame: CGRect? = nil) {
         guard !isClosed, window == nil, let image else { return }
         let screenFrame = NSScreen.screens.first { $0.frame.contains(NSEvent.mouseLocation) }?.visibleFrame
             ?? NSScreen.main?.visibleFrame ?? CGRect(x: 0, y: 0, width: 1024, height: 768)
-        let rect = Self.initialFrame(imageSize: image.size, visibleFrame: screenFrame)
+        // displayFrame is the small drag preview from the screenshot shelf.
+        // Use it only to choose where the pin appears; size the window from
+        // the original image so the shelf thumbnail does not become its size.
+        let rect = Self.initialFrame(imageSize: image.size, visibleFrame: screenFrame, near: displayFrame)
 
         let window = PinWindow(contentRect: rect, styleMask: [.borderless, .resizable], backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
@@ -61,14 +64,18 @@ final class PinWindowController: NSObject, NSWindowDelegate {
         callback?()
     }
 
-    static func initialFrame(imageSize: CGSize, visibleFrame: CGRect) -> CGRect {
+    static func initialFrame(imageSize: CGSize, visibleFrame: CGRect, near displayFrame: CGRect? = nil) -> CGRect {
         let source = imageSize.width > 0 && imageSize.height > 0 ? imageSize : CGSize(width: 480, height: 320)
         let scale = min(1, 720 / max(source.width, source.height),
                         max(1, visibleFrame.width) / source.width,
                         max(1, visibleFrame.height) / source.height)
         let size = CGSize(width: min(visibleFrame.width, source.width * scale),
                           height: min(visibleFrame.height, source.height * scale))
-        return CGRect(x: floor(visibleFrame.midX - size.width / 2), y: floor(visibleFrame.midY - size.height / 2),
+        let center = displayFrame.map { CGPoint(x: $0.midX, y: $0.midY) }
+            ?? CGPoint(x: visibleFrame.midX, y: visibleFrame.midY)
+        let x = min(max(floor(center.x - size.width / 2), visibleFrame.minX), visibleFrame.maxX - size.width)
+        let y = min(max(floor(center.y - size.height / 2), visibleFrame.minY), visibleFrame.maxY - size.height)
+        return CGRect(x: x, y: y,
                       width: size.width, height: size.height)
     }
 }

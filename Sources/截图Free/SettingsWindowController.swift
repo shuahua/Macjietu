@@ -14,6 +14,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     private let settingsStore: SettingsStore
     private var window: NSWindow?
     private let autoCopyButton = GlassButton(checkboxWithTitle: "截图后自动复制到剪贴板", target: nil, action: nil)
+    private let shelfButton = GlassButton(checkboxWithTitle: "启用顶部截图架（持续生效）", target: nil, action: nil)
     private let launchAtLoginButton = GlassButton(checkboxWithTitle: "开机自动启动", target: nil, action: nil)
     private let exportScalePopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let exportScaleOptions = ScreenshotExportScale.allCases
@@ -75,6 +76,11 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         autoCopyButton.target = self
         autoCopyButton.action = #selector(settingsChanged)
         detail.addSubview(autoCopyButton)
+        shelfButton.state = settings.screenshotShelfEnabled ? .on : .off
+        shelfButton.frame = CGRect(x: 20, y: 154, width: 320, height: 24)
+        shelfButton.target = self
+        shelfButton.action = #selector(settingsChanged)
+        detail.addSubview(shelfButton)
 
         launchAtLoginButton.state = settings.launchAtLogin || LoginItemService.isEnabled ? .on : .off
         launchAtLoginButton.frame = CGRect(x: 20, y: 90, width: 260, height: 24)
@@ -151,6 +157,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     private func saveCurrentSettings() {
         var settings = settingsStore.load()
         settings.autoCopyAfterCapture = autoCopyButton.state == .on
+        settings.screenshotShelfEnabled = shelfButton.state == .on
         settings.launchAtLogin = launchAtLoginButton.state == .on
         settings.exportScale = exportScaleOptions[max(0, exportScalePopup.indexOfSelectedItem)].rawValue
 
@@ -190,7 +197,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
             detail.addSubview(label)
         case .shortcuts:
             for (index, action) in ShortcutAction.allCases.enumerated() {
-                let y = 340 - index * 46
+                let y = 350 - index * 40
                 let name = GlassButton(title: action.title, target: self, action: #selector(recordClicked(_:)))
                 name.tag = index
                 name.isBordered = false

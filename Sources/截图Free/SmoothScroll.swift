@@ -13,7 +13,7 @@ enum SmoothScroll {
         for segment in segments(delta: delta) {
             try Task.checkCancellation()
             try post(segment)
-            try await Task.sleep(nanoseconds: 16_000_000)
+            try await Task.sleep(nanoseconds: 13_000_000)
         }
     }
 }

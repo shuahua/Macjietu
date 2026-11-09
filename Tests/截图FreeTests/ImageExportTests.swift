@@ -31,6 +31,8 @@ final class ImageExportTests: XCTestCase {
             let canvas = AnnotationCanvasView(frame: CGRect(x: 0, y: 0, width: 12, height: 8), image: image)
             for scale in 1...3 {
                 let bitmap = try png(canvas.renderedImage(scale: CGFloat(scale)))
+                let autoData = try XCTUnwrap(canvas.automaticCopySnapshot(scale: CGFloat(scale)))()
+                XCTAssertEqual(autoData, try ImageEncoding.pngData(from: canvas.renderedImage(scale: CGFloat(scale))))
                 XCTAssertEqual(bitmap.pixelsWide, 24 * scale)
                 XCTAssertEqual(bitmap.pixelsHigh, 16 * scale)
                 canvas.setCanvasDisplaySize(CGSize(width: 36, height: 24))
@@ -67,6 +69,8 @@ final class ImageExportTests: XCTestCase {
         editor.string = "A"
         canvas.textDidChange(Notification(name: NSText.didChangeNotification, object: editor))
         for scale in 1...3 {
+            let autoData = try XCTUnwrap(canvas.automaticCopySnapshot(scale: CGFloat(scale)))()
+            XCTAssertEqual(autoData, try ImageEncoding.pngData(from: canvas.renderedImage(scale: CGFloat(scale))))
             let bitmap = try png(canvas.renderedImage(scale: CGFloat(scale)))
             XCTAssertEqual(bitmap.pixelsWide, 24 * scale)
             XCTAssertEqual(bitmap.pixelsHigh, 16 * scale)

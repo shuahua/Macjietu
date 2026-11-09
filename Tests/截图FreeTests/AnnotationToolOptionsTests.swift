@@ -48,26 +48,37 @@ final class AnnotationToolOptionsTests: XCTestCase {
     func testAllToolbarEntriesShareStyleControlsAndCloseOldPanels() throws {
         _ = NSApplication.shared
         for zoom in [false, true] {
+            let before = Set(NSApp.windows.map(ObjectIdentifier.init))
             let controller = AnnotationEditorController(image: NSImage(size: CGSize(width: 400, height: 300)), allowsZoom: zoom)
             controller.show()
             defer { _ = controller.perform(NSSelectorFromString("closeWindow")) }
-            let window = try XCTUnwrap(NSApp.windows.first { $0.isVisible && $0.title == "截图编辑" })
+            let window = try XCTUnwrap(NSApp.windows.first { !before.contains(ObjectIdentifier($0)) && $0.title == "截图编辑" })
             let views = descendants(try XCTUnwrap(window.contentView))
             let canvas = try XCTUnwrap(views.compactMap { $0 as? AnnotationCanvasView }.first)
+            let tools = views.compactMap { $0 as? NSSegmentedControl }.filter { $0.action == NSSelectorFromString("iconToolChanged:") }
+            XCTAssertEqual(tools.count, 4)
             let segments = try XCTUnwrap(views.compactMap { $0 as? NSSegmentedControl }.first)
-            let popup = try XCTUnwrap(views.compactMap { $0 as? NSPopUpButton }.first)
+            XCTAssertEqual(segments.segmentStyle, .separated)
+            XCTAssertTrue(views.compactMap { $0 as? NSPopUpButton }.isEmpty)
             func panel() throws -> NSWindow { try XCTUnwrap(window.childWindows?.first) }
             func selectSegment(_ index: Int) {
                 segments.selectedSegment = index
                 segments.sendAction(segments.action, to: segments.target)
             }
-            for (index, tool) in [AnnotationTool.rectangle, .oval, .line, .arrow].enumerated() {
+            for tool in [AnnotationTool.rectangle, .oval, .line, .arrow] {
+                let button = try XCTUnwrap(tools.first { $0.toolTip == tool.rawValue })
+                XCTAssertEqual(button.label(forSegment: 0), "")
+                XCTAssertNotNil(button.image(forSegment: 0))
+                XCTAssertEqual(button.accessibilityLabel(), tool.rawValue)
+                let root = try XCTUnwrap(window.contentView)
+                let point = button.convert(CGPoint(x: button.bounds.midX, y: button.bounds.midY), to: root)
+                XCTAssertTrue(root.hitTest(point) === button)
                 selectSegment(0)
                 let old = try panel()
-                popup.selectItem(at: index)
-                popup.sendAction(popup.action, to: popup.target)
+                button.performClick(nil)
                 XCTAssertEqual(canvas.tool, tool)
-                XCTAssertEqual(segments.selectedSegment, -1)
+                XCTAssertEqual(button.selectedSegment, 0)
+                XCTAssertEqual(tools.filter { $0.selectedSegment == 0 }.count, 1)
                 XCTAssertFalse(old.isVisible)
                 XCTAssertNil(old.contentView)
                 let current = try panel()
@@ -81,7 +92,8 @@ final class AnnotationToolOptionsTests: XCTestCase {
                 let color = try XCTUnwrap(controls.compactMap { $0 as? NSButton }.first { $0.tag == 3 })
                 color.performClick(nil)
                 XCTAssertEqual(canvas.strokeColor, .systemBlue)
-                popup.sendAction(popup.action, to: popup.target)
+                button.performClick(nil)
+                XCTAssertEqual(button.selectedSegment, -1)
                 XCTAssertEqual(canvas.tool, .none)
                 XCTAssertTrue(window.childWindows?.isEmpty ?? true)
                 XCTAssertFalse(current.isVisible)
@@ -95,8 +107,14 @@ final class AnnotationToolOptionsTests: XCTestCase {
                     XCTAssertEqual(controls.compactMap { $0 as? NSSlider }.first?.tag, 1)
                 }
                 selectSegment(index)
-                XCTAssertEqual(canvas.tool, .none)
-                XCTAssertTrue(window.childWindows?.isEmpty ?? true)
+                if index == 3 {
+                    XCTAssertEqual(canvas.tool, .text)
+                    XCTAssertTrue(canvas.textCreationArmed)
+                    canvas.tool = .none
+                } else {
+                    XCTAssertEqual(canvas.tool, .none)
+                    XCTAssertTrue(window.childWindows?.isEmpty ?? true)
+                }
             }
             // 直接 action 入口也必须支持切换和再次点击关闭。
             for name in ["selectRectangle", "selectOval", "selectLine", "selectArrow"] {

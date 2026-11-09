@@ -12,7 +12,7 @@ enum AnnotationTool: String {
     case mosaic = "马赛克"
 }
 
-enum AnnotationShape {
+enum AnnotationShape: Equatable {
     case pen([CGPoint], NSColor, CGFloat)
     case text(String, CGPoint, NSColor, CGFloat, String, TextWeight, Bool)
     case rectangle(CGRect, NSColor, CGFloat)
@@ -43,9 +43,25 @@ private final class AnnotationOptionsPanel: NSPanel {
     override var canBecomeMain: Bool { false }
 }
 
-private final class AnnotationEditorWindow: NSWindow {
+final class AnnotationEditorWindow: NSWindow {
     var onEscape: (() -> Void)?
+    weak var annotationCanvas: AnnotationCanvasView?
     override var canBecomeKey: Bool { true }
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask).subtracting([.capsLock, .numericPad, .function])
+        guard event.charactersIgnoringModifiers?.lowercased() == "z",
+              flags == [.command] || flags == [.command, .shift] else { return super.performKeyEquivalent(with: event) }
+        if let text = firstResponder as? NSTextView {
+            // 输入法组合态不可被画布撤销打断；文字编辑使用自己的原生历史。
+            if text.hasMarkedText() { return true }
+            if flags.contains(.shift) { text.undoManager?.redo() } else { text.undoManager?.undo() }
+            return true
+        }
+        guard let annotationCanvas else { return super.performKeyEquivalent(with: event) }
+        if flags.contains(.shift) { annotationCanvas.redoAnnotation() } else { annotationCanvas.undoAnnotation() }
+        return true
+    }
 
     override func keyDown(with event: NSEvent) {
         if event.keyCode == 53 {
@@ -87,13 +103,16 @@ final class MediaDisplayView: NSView {
 
 @MainActor
 final class AnnotationEditorController: NSObject {
-    private let minimumToolbarWidth: CGFloat = 560
+    private let minimumToolbarWidth: CGFloat = 600
     private let horizontalPadding = GlassView.shadowPadding
     private let verticalPadding = GlassView.shadowPadding
     private let topSafePadding: CGFloat = 36
     var onComplete: ((NSImage) -> Void)?
     var onCancel: (() -> Void)?
     var onCopy: ((NSImage) -> Void)?
+    let clipboardSessionID = UUID()
+    var onContentChange: ((UInt64) -> Void)?
+    var onClipboardClose: (() -> Void)?
     var onSave: ((NSImage) -> Bool)?
     var onPin: ((NSImage) -> Void)?
     var onClose: (() -> Void)?
@@ -110,7 +129,8 @@ final class AnnotationEditorController: NSObject {
     private var resizeHandleView: ResizeHandleView?
     private var baseCanvasSize: CGSize = .zero
     private var toolControl: NSSegmentedControl?
-    private var shapePopup: NSPopUpButton?
+    private let segmentTools: [AnnotationTool] = [.pen, .eraser, .mosaic, .text]
+    private var shapeButtons: [NSSegmentedControl] = []
     private var selectedShapeTool: AnnotationTool = .rectangle
     private var isShapeToolActive = false
     private var strokeSlider: NSSlider?
@@ -136,6 +156,7 @@ final class AnnotationEditorController: NSObject {
     }
 
     func show() {
+        if let window { window.makeKeyAndOrderFront(nil); return }
         if allowsZoom {
             showLongScreenshotEditor()
         } else {
@@ -246,6 +267,7 @@ final class AnnotationEditorController: NSObject {
 
     private func makeEditorWindow(rect: CGRect, contentView: NSView) -> AnnotationEditorWindow {
         let window = AnnotationEditorWindow(contentRect: rect, styleMask: [.borderless], backing: .buffered, defer: false)
+        window.annotationCanvas = canvasView
         window.onEscape = { [weak self] in
             guard let self else { return }
             if self.canvasView?.commitTextEditing() == true { return }
@@ -272,6 +294,7 @@ final class AnnotationEditorController: NSObject {
 
     @objc private func selectText() {
         deactivateShapeTool()
+        canvasView?.commitTextEditing()
         canvasView?.tool = .text
         canvasView?.onTextSelectionChanged = { [weak self] in
             guard let self, let canvas = self.canvasView else { return }
@@ -313,82 +336,15 @@ final class AnnotationEditorController: NSObject {
         }
         selectedShapeTool = tool
         isShapeToolActive = true
-        toolControl?.selectedSegment = -1
         canvasView?.tool = tool
         showPenOptions()
-        updateShapePopup(selectedIndex: index)
+        updateShapePopupAppearance()
     }
 
     @objc private func selectMosaic() {
         deactivateShapeTool()
         canvasView?.tool = .mosaic
         closeOptionsWindow()
-    }
-
-    @objc private func toolChanged(_ sender: NSSegmentedControl) {
-        if canvasView?.tool == tool(for: sender.selectedSegment) {
-            canvasView?.tool = .none
-            deactivateShapeTool()
-            closeOptionsWindow()
-            sender.selectedSegment = -1
-            return
-        }
-
-        switch sender.selectedSegment {
-        case -1:
-            canvasView?.tool = .none
-            deactivateShapeTool()
-            closeOptionsWindow()
-        case 1:
-            selectEraser()
-        case 2:
-            selectMosaic()
-        case 3:
-            selectText()
-        default:
-            selectPen()
-        }
-    }
-
-    private func tool(for segment: Int) -> AnnotationTool {
-        switch segment {
-        case 0: return .pen
-        case 1: return .eraser
-        case 2: return .mosaic
-        case 3: return .text
-        default: return .none
-        }
-    }
-
-    @objc private func shapePopupChanged(_ sender: NSPopUpButton) {
-        let selectedTool = shapeTool(for: sender.indexOfSelectedItem)
-        if isShapeToolActive && selectedTool == selectedShapeTool {
-            deactivateShapeTool()
-            closeOptionsWindow()
-            return
-        }
-
-        switch selectedTool {
-        case .oval: selectOval()
-        case .line: selectLine()
-        case .arrow: selectArrow()
-        default: selectRectangle()
-        }
-    }
-
-    private func updateShapePopup(selectedIndex: Int) {
-        shapePopup?.selectItem(at: selectedIndex)
-        shapePopup?.toolTip = shapePopup?.selectedItem?.title
-        updateShapePopupAppearance()
-    }
-
-    private func shapeTool(for selectedIndex: Int) -> AnnotationTool {
-        switch selectedIndex {
-        case 1: return .oval
-        case 2: return .line
-        case 3: return .arrow
-        default: return .rectangle
-        }
     }
 
     private func deactivateShapeTool() {
@@ -400,11 +356,42 @@ final class AnnotationEditorController: NSObject {
     }
 
     private func updateShapePopupAppearance() {
-        guard let shapePopup else { return }
-        shapePopup.wantsLayer = true
-        shapePopup.layer?.cornerRadius = 6
-        shapePopup.layer?.borderWidth = isShapeToolActive ? 2 : 0
-        shapePopup.layer?.borderColor = NSColor.controlAccentColor.cgColor
+        toolControl?.selectedSegment = segmentTools.firstIndex(of: canvasView?.tool ?? .none) ?? -1
+        for button in shapeButtons {
+            button.selectedSegment = button.toolTip == canvasView?.tool.rawValue ? 0 : -1
+        }
+        if canvasView?.tool == AnnotationTool.none { closeOptionsWindow() }
+    }
+
+    @objc private func toolChanged(_ sender: NSSegmentedControl) {
+        guard segmentTools.indices.contains(sender.selectedSegment) else { return }
+        selectTool(segmentTools[sender.selectedSegment])
+    }
+
+    @objc private func iconToolChanged(_ sender: NSSegmentedControl) {
+        guard let name = sender.toolTip, let tool = AnnotationTool(rawValue: name) else { return }
+        selectTool(tool)
+    }
+
+    private func selectTool(_ tool: AnnotationTool) {
+        if canvasView?.tool == tool && tool != .text {
+            canvasView?.tool = .none
+            isShapeToolActive = false
+            closeOptionsWindow()
+        } else {
+            switch tool {
+            case .pen: selectPen()
+            case .eraser: selectEraser()
+            case .mosaic: selectMosaic()
+            case .text: selectText()
+            case .rectangle: selectRectangle()
+            case .oval: selectOval()
+            case .line: selectLine()
+            case .arrow: selectArrow()
+            case .none: break
+            }
+        }
+        updateShapePopupAppearance()
     }
 
     @objc private func clearAnnotations() {
@@ -649,6 +636,14 @@ final class AnnotationEditorController: NSObject {
         return canvasView?.renderedImage(scale: exportScale)
     }
 
+    func automaticCopySnapshot() -> ClipboardService.Render? {
+        canvasView?.automaticCopySnapshot(scale: exportScale)
+    }
+
+    func shelfSnapshot() -> ClipboardService.Render? {
+        canvasView?.automaticCopySnapshot(scale: 1)
+    }
+
     @objc private func closeWindow() {
         guard !didClose else { return }
         didClose = true
@@ -664,6 +659,9 @@ final class AnnotationEditorController: NSObject {
     }
 
     private func tearDownViews() {
+        onClipboardClose?()
+        onClipboardClose = nil
+        onContentChange = nil
         canvasView?.dispose()
         closeOptionsWindow()
         resizeHandleView?.onResize = nil
@@ -675,7 +673,7 @@ final class AnnotationEditorController: NSObject {
         toolbarView = nil
         resizeHandleView = nil
         toolControl = nil
-        shapePopup = nil
+        shapeButtons.removeAll()
         strokeSlider = nil
         strokeValueLabel = nil
         colorWells.removeAll()
@@ -698,51 +696,43 @@ final class AnnotationEditorController: NSObject {
         toolbarView = toolbar
 
         // 控件组按实际 fit 宽度居中，而不是让固定宽度外框看起来偏左。
-        let fittedGroupWidth: CGFloat = 482
-        let leftInset: CGFloat = max(8, (toolbarSize.width - fittedGroupWidth) / 2)
+        let fittedGroupWidth: CGFloat = 546
+        let leftInset: CGFloat = max(6, (toolbarSize.width - fittedGroupWidth) / 2)
         let topRowY = toolbarSize.height - 46
         let toolControl = NSSegmentedControl(images: [
-            systemImage("pencil.tip"),
-            systemImage("eraser"),
-            systemImage("checkerboard.rectangle"),
-            systemImage("textformat")
+            systemImage("pencil.tip"), systemImage("eraser"),
+            systemImage("checkerboard.rectangle"), textToolImage()
         ], trackingMode: .selectOne, target: self, action: #selector(toolChanged(_:)))
         toolControl.frame = CGRect(x: leftInset, y: topRowY, width: 174, height: 30)
         toolControl.segmentStyle = .separated
         toolControl.selectedSegment = -1
-        toolControl.setToolTip("画笔", forSegment: 0)
-        toolControl.setToolTip("橡皮", forSegment: 1)
-        toolControl.setToolTip("马赛克", forSegment: 2)
-        toolControl.setToolTip("文字", forSegment: 3)
+        for (index, tool) in segmentTools.enumerated() {
+            toolControl.setLabel("", forSegment: index)
+            toolControl.setToolTip(tool.rawValue, forSegment: index)
+        }
         toolbar.addSubview(toolControl)
         self.toolControl = toolControl
-
-        let shapePopup = NSPopUpButton(frame: CGRect(x: toolControl.frame.maxX + 8, y: topRowY, width: 96, height: 30), pullsDown: false)
-        shapePopup.addItem(withTitle: "矩形")
-        shapePopup.addItem(withTitle: "圆形")
-        shapePopup.addItem(withTitle: "直线")
-        shapePopup.addItem(withTitle: "箭头")
-        shapePopup.item(at: 0)?.image = systemImage("rectangle")
-        shapePopup.item(at: 1)?.image = systemImage("circle")
-        shapePopup.item(at: 2)?.image = systemImage("line.diagonal")
-        shapePopup.item(at: 3)?.image = systemImage("arrow.up.right")
-        shapePopup.target = self
-        shapePopup.action = #selector(shapePopupChanged(_:))
-        shapePopup.toolTip = "形状：矩形"
-        shapePopup.wantsLayer = true
-        shapePopup.layer?.cornerRadius = 6
-        shapePopup.layer?.masksToBounds = true
-        toolbar.addSubview(shapePopup)
-        self.shapePopup = shapePopup
-
-        let clearButton = addIconButton(symbolName: "trash", tooltip: "清空", x: shapePopup.frame.maxX + 8, y: topRowY, action: #selector(clearAnnotations), to: toolbar)
+        let entries: [(String, String)] = [
+            ("rectangle", "矩形"), ("circle", "圆形"),
+            ("line.diagonal", "直线"), ("arrow.up.right", "箭头")
+        ]
+        shapeButtons = entries.enumerated().map { index, entry in
+            let button = addIconButton(symbolName: entry.0, tooltip: entry.1, x: toolControl.frame.maxX + 8 + CGFloat(index) * 42, y: topRowY, action: #selector(iconToolChanged(_:)), to: toolbar)
+            button.trackingMode = .selectOne
+            button.setAccessibilityLabel(entry.1)
+            return button
+        }
+        canvasView?.onToolChanged = { [weak self] in self?.updateShapePopupAppearance() }
+        canvasView?.onContentChange = { [weak self] revision in self?.onContentChange?(revision) }
+        updateShapePopupAppearance()
+        let clearButton = addIconButton(symbolName: "trash", tooltip: "清空", x: shapeButtons.last!.frame.maxX + 8, y: topRowY, action: #selector(clearAnnotations), to: toolbar)
 
         let actionStartX = clearButton.frame.maxX + 14
         addDivider(to: toolbar, x: actionStartX - 8, y: topRowY + 3, height: 24)
         addIconButton(symbolName: "doc.on.doc", tooltip: "复制", x: actionStartX, y: topRowY, action: #selector(copyImage), to: toolbar)
         addIconButton(symbolName: "square.and.arrow.down", tooltip: "保存", x: actionStartX + 38, y: topRowY, action: #selector(saveImage), to: toolbar)
         addIconButton(symbolName: "pin", tooltip: "贴图", x: actionStartX + 76, y: topRowY, action: #selector(pinImage), to: toolbar)
-        addIconButton(symbolName: "xmark", tooltip: "关闭", x: actionStartX + 114, y: topRowY, action: #selector(closeWindow), to: toolbar, isDestructive: true)
+        addIconButton(symbolName: "xmark", tooltip: "关闭", x: actionStartX + 114, y: topRowY, action: #selector(closeWindow), to: toolbar)
 
         guard showsZoomControls else { return }
         let zoomRowY = topRowY - 40
@@ -862,22 +852,35 @@ final class AnnotationEditorController: NSObject {
     }
 
     @discardableResult
-    private func addIconButton(symbolName: String, tooltip: String, x: CGFloat, y: CGFloat, action: Selector, to contentView: NSView, isDestructive: Bool = false) -> NSButton {
-        let button = GlassButton(image: systemImage(symbolName), target: self, action: action)
+    private func addIconButton(symbolName: String, tooltip: String, x: CGFloat, y: CGFloat, action: Selector, to contentView: NSView) -> NSSegmentedControl {
+        // 与左侧画笔完全相同的系统表面；操作使用 momentary，形状由调用处改为 selectOne。
+        let button = NSSegmentedControl(images: [systemImage(symbolName)], trackingMode: .momentary, target: self, action: action)
         button.setAccessibilityLabel(tooltip)
         button.frame = CGRect(x: x, y: y, width: 34, height: 30)
-        button.bezelStyle = .rounded
+        button.segmentStyle = .separated
         button.controlSize = .regular
-        button.imagePosition = .imageOnly
+        button.setLabel("", forSegment: 0)
+        button.setToolTip(tooltip, forSegment: 0)
+        button.selectedSegment = -1
         button.toolTip = tooltip
-        if ["trash", "doc.on.doc", "square.and.arrow.down", "pin"].contains(symbolName) {
-            button.useMomentaryActionSurface()
-        }
-        if isDestructive {
-            button.contentTintColor = .systemRed
-        }
         contentView.addSubview(button)
         return button
+    }
+
+    private func textToolImage() -> NSImage {
+        // 不使用可能携带本地化文字的系统符号，像素内容明确为 Aa。
+        let image = NSImage(size: NSSize(width: 22, height: 18), flipped: false) { bounds in
+            let text = NSAttributedString(string: "Aa", attributes: [
+                .font: NSFont.systemFont(ofSize: 14, weight: .medium),
+                .foregroundColor: NSColor.black
+            ])
+            let size = text.size()
+            text.draw(at: NSPoint(x: (bounds.width - size.width) / 2, y: (bounds.height - size.height) / 2))
+            return true
+        }
+        image.isTemplate = true
+        image.accessibilityDescription = "文字 Aa"
+        return image
     }
 
     private func addDivider(to contentView: NSView, x: CGFloat, y: CGFloat, height: CGFloat) {
@@ -967,6 +970,23 @@ private final class ResizeHandleView: NSView {
 }
 
 private final class CanvasTextView: NSTextView {
+    var onLayoutChange: (() -> Void)?
+    var onCompositionEnded: (() -> Void)?
+    override func didChangeText() {
+        super.didChangeText()
+        onLayoutChange?()
+    }
+    override func setMarkedText(_ string: Any, selectedRange: NSRange, replacementRange: NSRange) {
+        super.setMarkedText(string, selectedRange: selectedRange, replacementRange: replacementRange)
+        onLayoutChange?()
+    }
+    override func unmarkText() {
+        super.unmarkText()
+        onLayoutChange?()
+        onCompositionEnded?()
+    }
+    private let typingUndoManager = UndoManager()
+    override var undoManager: UndoManager? { typingUndoManager }
     var onEscape: (() -> Void)?
     private var movingText = false
     private weak var dragCanvas: NSView?
@@ -991,19 +1011,45 @@ private final class CanvasTextView: NSTextView {
 
 private final class TextResizeHandle: NSView {
     var onDelta: ((CGFloat) -> Void)?
+    var onBegin: (() -> Void)?
+    var onEnd: (() -> Void)?
     private var last: CGPoint?
     override init(frame: NSRect) { super.init(frame: frame); wantsLayer = true; layer?.backgroundColor = NSColor.controlAccentColor.cgColor; layer?.cornerRadius = 3 }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
     override func resetCursorRects() { addCursorRect(bounds, cursor: .crosshair) }
-    override func mouseDown(with event: NSEvent) { last = event.locationInWindow }
+    override func mouseDown(with event: NSEvent) { onBegin?(); last = event.locationInWindow }
     override func mouseDragged(with event: NSEvent) { let p = event.locationInWindow; if let last { onDelta?(p.x - last.x) }; last = p }
-    override func mouseUp(with event: NSEvent) { last = nil }
+    override func mouseUp(with event: NSEvent) { last = nil; onEnd?() }
 }
 
-final class AnnotationCanvasView: NSView, NSTextViewDelegate {
+final class AnnotationCanvasView: NSView, NSTextViewDelegate, NSLayoutManagerDelegate {
     var tool: AnnotationTool = .none {
-        willSet { if tool == .text && newValue != .text { commitTextEditing(); shapes += editableTexts; editableTexts.removeAll() } }
+        willSet {
+            cancelTextPress()
+            clearCompletedSelection()
+            if tool == .text && newValue != .text {
+                commitTextEditing()
+                shapes += editableTexts
+                editableTexts.removeAll()
+                // 会话结束是不可逆的编辑权限边界，不是内容操作。
+                history = history.map { $0.fixedTexts() }
+                future = future.map { $0.fixedTexts() }
+                checkpoint = snapshot()
+                notifiedContent = notifiedContent.fixedTexts()
+            }
+        }
+        didSet { textCreationArmed = tool == .text; onToolChanged?() }
     }
+    var onToolChanged: (() -> Void)?
+    private(set) var textCreationArmed = false
+    private struct TextTarget { let fixed: Bool; let index: Int }
+    private var pendingTextTarget: TextTarget?
+    private var completedSelection: TextTarget?
+    private var textPressTimer: Timer?
+    private var pressPoint: CGPoint?
+    private var completedDragActive = false
+    private var layingOutText = false
+    private var synchronizingText = false
     var strokeColor: NSColor = .systemRed { didSet { updateSelectedTextStyle() } }
     var strokeWidth: CGFloat = 4
     var textPointSize: CGFloat = 20 { didSet { updateSelectedTextStyle() } }
@@ -1017,6 +1063,18 @@ final class AnnotationCanvasView: NSView, NSTextViewDelegate {
     private var loadingTextStyle = false
     private var textDragPoint: CGPoint?
     var onTextSelectionChanged: (() -> Void)?
+    var onContentChange: ((UInt64) -> Void)?
+    private(set) var contentRevision: UInt64 = 0
+    private var notifiedContent = Snapshot(shapes: [], texts: [])
+
+    private func notifyContentChange() {
+        guard !historyTransaction, textEditor?.hasMarkedText() != true else { return }
+        let next = snapshot()
+        guard next != notifiedContent else { return }
+        notifiedContent = next
+        contentRevision &+= 1
+        onContentChange?(contentRevision)
+    }
 
     private let image: NSImage
     private let imageSize: CGSize
@@ -1024,6 +1082,70 @@ final class AnnotationCanvasView: NSView, NSTextViewDelegate {
     private var currentPenPoints: [CGPoint] = []
     private var dragStart: CGPoint?
     private var dragCurrent: CGPoint?
+
+    // 仅保存矢量值（数组写时复制），从不复制源图或导出位图。
+    private struct Snapshot: Equatable {
+        var shapes: [AnnotationShape]
+        var texts: [AnnotationShape]
+        func fixedTexts() -> Snapshot { Snapshot(shapes: shapes + texts, texts: []) }
+    }
+    private var history: [Snapshot] = []
+    private var future: [Snapshot] = []
+    private var checkpoint = Snapshot(shapes: [], texts: [])
+    private var historyTransaction = false
+    private var updatingTypedText = false
+    var canUndoAnnotation: Bool { !history.isEmpty }
+    var canRedoAnnotation: Bool { !future.isEmpty }
+
+    private func snapshot() -> Snapshot {
+        Snapshot(shapes: shapes, texts: editableTexts.filter {
+            if case let .text(text, _, _, _, _, _, _) = $0 { return !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            return true
+        })
+    }
+
+    private func recordHistory() {
+        defer { notifyContentChange() }
+        guard !historyTransaction, !updatingTypedText else { return }
+        let next = snapshot()
+        guard next != checkpoint else { return }
+        history.append(checkpoint)
+        checkpoint = next
+        future.removeAll()
+    }
+
+    private func beginHistoryTransaction() { recordHistory(); historyTransaction = true }
+    private func endHistoryTransaction() { historyTransaction = false; recordHistory() }
+
+    func undoAnnotation() {
+        guard !historyTransaction else { return }
+        commitTextEditing()
+        guard let previous = history.popLast() else { return }
+        future.append(checkpoint)
+        restore(previous)
+    }
+
+    func redoAnnotation() {
+        guard !historyTransaction else { return }
+        commitTextEditing()
+        guard let next = future.popLast() else { return }
+        history.append(checkpoint)
+        restore(next)
+    }
+
+    private func restore(_ state: Snapshot) {
+        cancelTextPress()
+        clearCompletedSelection()
+        removeTextEditor()
+        shapes = state.shapes
+        editableTexts = state.texts
+        checkpoint = state
+        notifyContentChange()
+        currentPenPoints.removeAll()
+        dragStart = nil
+        dragCurrent = nil
+        needsDisplay = true
+    }
 
     init(frame: CGRect, image: NSImage) {
         self.image = image
@@ -1046,6 +1168,9 @@ final class AnnotationCanvasView: NSView, NSTextViewDelegate {
     override var acceptsFirstResponder: Bool { true }
 
     func clear() {
+        cancelTextPress()
+        clearCompletedSelection()
+        commitTextEditing()
         removeTextEditor()
         editableTexts.removeAll()
         shapes.removeAll()
@@ -1053,11 +1178,17 @@ final class AnnotationCanvasView: NSView, NSTextViewDelegate {
         dragStart = nil
         dragCurrent = nil
         needsDisplay = true
+        recordHistory()
     }
 
     func dispose() {
+        onContentChange = nil
+        onToolChanged = nil
         onTextSelectionChanged = nil
         clear()
+        history.removeAll()
+        future.removeAll()
+        checkpoint = Snapshot(shapes: [], texts: [])
         layer?.contents = nil
         removeFromSuperview()
     }
@@ -1075,11 +1206,21 @@ final class AnnotationCanvasView: NSView, NSTextViewDelegate {
 
     func setCanvasDisplaySize(_ size: CGSize) {
         guard size.width > 1, size.height > 1, bounds.size != size else { return }
+        cancelTextPress()
+        clearCompletedSelection()
         let selection = selectedTextIndex
         commitTextEditing()
         let oldSize = CGSize(width: max(bounds.width, 1), height: max(bounds.height, 1))
         let scaleX = size.width / oldSize.width
         let scaleY = size.height / oldSize.height
+        func scaledSnapshot(_ state: Snapshot) -> Snapshot {
+            Snapshot(shapes: state.shapes.map { scaledShape($0, scaleX: scaleX, scaleY: scaleY) },
+                     texts: state.texts.map { scaledShape($0, scaleX: scaleX, scaleY: scaleY) })
+        }
+        history = history.map(scaledSnapshot)
+        future = future.map(scaledSnapshot)
+        checkpoint = scaledSnapshot(checkpoint)
+        notifiedContent = scaledSnapshot(notifiedContent)
         shapes = shapes.map { scaledShape($0, scaleX: scaleX, scaleY: scaleY) }
         editableTexts = editableTexts.map { scaledShape($0, scaleX: scaleX, scaleY: scaleY) }
         currentPenPoints = currentPenPoints.map { scaledPoint($0, scaleX: scaleX, scaleY: scaleY) }
@@ -1161,33 +1302,62 @@ final class AnnotationCanvasView: NSView, NSTextViewDelegate {
         return NSImage(cgImage: cgImage, size: outputSize)
     }
 
+    /// 只捕获不可变源位图和矢量值，不提交输入、不带选框/手柄，也不在 UI 线程合成大图。
+    func automaticCopySnapshot(scale: CGFloat = 1) -> ClipboardService.Render? {
+        guard !historyTransaction, textEditor?.hasMarkedText() != true,
+              let source = ImageEncoding.sourceCGImage(from: image) else { return nil }
+        let renderer = AnnotationRasterizer(source: source, bounds: bounds,
+                                             shapes: shapes + editableTexts, scale: scale)
+        return { try renderer.pngData() }
+    }
+
     override func draw(_ dirtyRect: NSRect) {
         drawCanvas(in: bounds, includeDraft: true)
     }
 
     override func mouseDown(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        if tool == .text || tool == .none {
+            // 外点只提交本次输入，不在同一个或随后的点击中续建。
+            if let editor = textEditor {
+                if event.modifierFlags.contains(.option) || editor.frame.insetBy(dx: -6, dy: -6).contains(point) {
+                    beginHistoryTransaction()
+                    textDragPoint = point
+                } else {
+                    commitTextEditing()
+                    tool = .none
+                }
+                return
+            }
+            cancelTextPress()
+            clearCompletedSelection()
+            if let target = completedText(at: point) {
+                window?.makeFirstResponder(self)
+                pendingTextTarget = target
+                pressPoint = point
+                let timer = Timer(timeInterval: 0.25, repeats: false) { [weak self] _ in
+                    MainActor.assumeIsolated { self?.activateTextPress() }
+                }
+                textPressTimer = timer
+                RunLoop.main.add(timer, forMode: .common)
+                return
+            }
+            if tool == .text {
+                if textCreationArmed { beginText(at: point) }
+                return
+            }
+        }
         window?.makeFirstResponder(self)
         if tool == .none {
             window?.performDrag(with: event)
             return
         }
 
-        let point = convert(event.locationInWindow, from: nil)
+        beginHistoryTransaction()
         dragStart = point
         dragCurrent = point
         if tool == .pen {
             currentPenPoints = [point]
-        } else if tool == .text {
-            let borderSelection = textEditor.flatMap { editor -> Int? in
-                editor.frame.insetBy(dx: -6, dy: -6).contains(point) && !editor.frame.insetBy(dx: 2, dy: 2).contains(point) ? selectedTextIndex : nil
-            }
-            commitTextEditing()
-            if let index = borderSelection.flatMap({ editableTexts.indices.contains($0) ? $0 : nil }) ?? editableTexts.indices.reversed().first(where: { shapeBounds(editableTexts[$0]).insetBy(dx: -6, dy: -6).contains(point) }) {
-                selectText(at: index)
-                textDragPoint = point
-            } else { beginText(at: point) }
-            dragStart = nil
-            dragCurrent = nil
         } else if tool == .eraser {
             eraseAnnotations(around: point)
         }
@@ -1195,6 +1365,19 @@ final class AnnotationCanvasView: NSView, NSTextViewDelegate {
     }
 
     override func mouseDragged(with event: NSEvent) {
+        if pendingTextTarget != nil {
+            let point = convert(event.locationInWindow, from: nil)
+            if completedDragActive, let last = pressPoint, let target = completedSelection,
+               case let .text(text, origin, color, size, name, weight, underline) = textShape(target) {
+                let next = CGPoint(x: min(max(4, origin.x + point.x - last.x), bounds.maxX - size - 8),
+                                   y: min(max(size + 4, origin.y + point.y - last.y), bounds.maxY - 4))
+                setTextShape(.text(text, next, color, size, name, weight, underline), target: target)
+                layoutCompletedHandle()
+                needsDisplay = true
+            }
+            pressPoint = point
+            return
+        }
         guard tool != .none else { return }
 
         let point = convert(event.locationInWindow, from: nil)
@@ -1212,6 +1395,8 @@ final class AnnotationCanvasView: NSView, NSTextViewDelegate {
     }
 
     override func mouseUp(with event: NSEvent) {
+        if pendingTextTarget != nil { cancelTextPress(); return }
+        defer { endHistoryTransaction() }
         textDragPoint = nil
         guard tool != .none else { return }
 
@@ -1267,6 +1452,10 @@ final class AnnotationCanvasView: NSView, NSTextViewDelegate {
             let border = NSBezierPath(rect: editor.frame.insetBy(dx: -4, dy: -4))
             border.lineWidth = 1
             border.stroke()
+        }
+        if includeDraft, let target = completedSelection, let shape = textShape(target) {
+            NSColor.controlAccentColor.setStroke()
+            NSBezierPath(rect: shapeBounds(shape).insetBy(dx: -4, dy: -4)).stroke()
         }
         if includeDraft {
             drawDraft()
@@ -1477,10 +1666,13 @@ final class AnnotationCanvasView: NSView, NSTextViewDelegate {
         return CGRect(x: origin.x, y: origin.y - size.height, width: min(maxWidth, size.width), height: size.height)
     }
 
-    // 仅当前文字工具会话中的对象可以进入编辑器；固定对象从不参与命中检测。
+    // 显式新建入口；画布事件另外受单次 armed 状态约束。
     func beginText(at point: CGPoint) {
         guard tool == .text else { return }
+        cancelTextPress()
+        clearCompletedSelection()
         commitTextEditing()
+        textCreationArmed = false
         editableTexts.append(.text("", clampedTextOrigin(point), strokeColor, textFontSize, textFontName, textWeight, textUnderline))
         selectText(at: editableTexts.count - 1)
     }
@@ -1515,10 +1707,21 @@ final class AnnotationCanvasView: NSView, NSTextViewDelegate {
         editor.toolTip = "直接输入文字；拖动边框移动，或按住 Option 拖动文字。Esc 结束当前输入。"
         editor.string = text
         editor.delegate = self
+        editor.layoutManager?.delegate = self
+        editor.onLayoutChange = { [weak self] in self?.synchronizeTypedText() }
+        editor.onCompositionEnded = { [weak self] in
+            guard let self else { return }
+            self.updatingTypedText = true
+            self.updateSelectedTextStyle()
+            self.updatingTypedText = false
+            self.notifyContentChange()
+        }
         editor.onEscape = { [weak self] in self?.commitTextEditing() }
         textEditor = editor
         addSubview(editor)
         let handle = TextResizeHandle(frame: .zero)
+        handle.onBegin = { [weak self] in self?.beginHistoryTransaction() }
+        handle.onEnd = { [weak self] in self?.endHistoryTransaction() }
         handle.onDelta = { [weak self] delta in self?.resizeSelectedText(by: delta) }
         addSubview(handle)
         textResizeHandle = handle
@@ -1532,6 +1735,9 @@ final class AnnotationCanvasView: NSView, NSTextViewDelegate {
     private func removeTextEditor() {
         if window?.firstResponder === textEditor { window?.makeFirstResponder(self) }
         textEditor?.delegate = nil
+        textEditor?.layoutManager?.delegate = nil
+        textEditor?.onLayoutChange = nil
+        textEditor?.onCompositionEnded = nil
         textEditor?.onEscape = nil
         textEditor?.removeFromSuperview()
         textResizeHandle?.removeFromSuperview()
@@ -1545,16 +1751,38 @@ final class AnnotationCanvasView: NSView, NSTextViewDelegate {
     @discardableResult
     func commitTextEditing() -> Bool {
         guard let index = selectedTextIndex, let editor = textEditor else { return false }
+        textCreationArmed = false
         // 将输入法的当前组合文本保存在对象中，再结束输入上下文。
         editor.unmarkText()
         updateSelectedTextStyle()
         let isEmpty = editor.string.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         removeTextEditor()
         if isEmpty { editableTexts.remove(at: index) }
+        recordHistory()
         return true
     }
 
-    func textDidChange(_ notification: Notification) { updateSelectedTextStyle() }
+    func textDidChange(_ notification: Notification) {
+        synchronizeTypedText()
+    }
+
+    private func synchronizeTypedText() {
+        guard !synchronizingText, !loadingTextStyle, let editor = textEditor,
+              let index = selectedTextIndex, editableTexts.indices.contains(index),
+              case let .text(_, origin, color, size, name, weight, underline) = editableTexts[index] else { return }
+        synchronizingText = true
+        updatingTypedText = true
+        editableTexts[index] = .text(editor.string, origin, color, size, name, weight, underline)
+        layoutTextEditor()
+        updatingTypedText = false
+        synchronizingText = false
+        notifyContentChange()
+    }
+
+    func layoutManager(_ layoutManager: NSLayoutManager, didCompleteLayoutFor textContainer: NSTextContainer?, atEnd layoutFinishedFlag: Bool) {
+        guard !layingOutText else { return }
+        synchronizeTypedText()
+    }
 
     private func updateSelectedTextStyle() {
         guard !loadingTextStyle, let index = selectedTextIndex, let editor = textEditor,
@@ -1569,14 +1797,19 @@ final class AnnotationCanvasView: NSView, NSTextViewDelegate {
         }
         editor.insertionPointColor = strokeColor
         layoutTextEditor()
+        recordHistory()
     }
 
     private func layoutTextEditor() {
+        guard !layingOutText else { return }
+        layingOutText = true
+        defer { layingOutText = false }
         guard let index = selectedTextIndex, let editor = textEditor,
               case let .text(text, origin, color, size, name, weight, underline) = editableTexts[index],
               let container = editor.textContainer, let manager = editor.layoutManager else { return }
         let maxWidth = max(1, bounds.maxX - origin.x - 4)
-        container.containerSize = CGSize(width: maxWidth, height: .greatestFiniteMagnitude)
+        let containerSize = CGSize(width: maxWidth, height: .greatestFiniteMagnitude)
+        if container.containerSize != containerSize { container.containerSize = containerSize }
         manager.ensureLayout(for: container)
         let used = manager.usedRect(for: container)
         // 最后一处换行后的空行也需要容纳插入光标。
@@ -1591,12 +1824,84 @@ final class AnnotationCanvasView: NSView, NSTextViewDelegate {
         needsDisplay = true
     }
 
+    private func completedText(at point: CGPoint) -> TextTarget? {
+        for fixed in [false, true] {
+            let values = fixed ? shapes : editableTexts
+            for index in values.indices.reversed() {
+                if case .text = values[index], shapeBounds(values[index]).insetBy(dx: -6, dy: -6).contains(point) {
+                    return TextTarget(fixed: fixed, index: index)
+                }
+            }
+        }
+        return nil
+    }
+
+    private func textShape(_ target: TextTarget) -> AnnotationShape? {
+        let values = target.fixed ? shapes : editableTexts
+        return values.indices.contains(target.index) ? values[target.index] : nil
+    }
+
+    private func setTextShape(_ shape: AnnotationShape, target: TextTarget) {
+        if target.fixed { shapes[target.index] = shape } else { editableTexts[target.index] = shape }
+    }
+
+    private func activateTextPress() {
+        guard let target = pendingTextTarget, tool == .none || tool == .text,
+              textShape(target) != nil, window != nil else { cancelTextPress(); return }
+        textPressTimer = nil
+        completedSelection = target
+        completedDragActive = true
+        beginHistoryTransaction()
+        let handle = TextResizeHandle(frame: .zero)
+        handle.onBegin = { [weak self] in self?.beginHistoryTransaction() }
+        handle.onEnd = { [weak self] in self?.endHistoryTransaction() }
+        handle.onDelta = { [weak self] delta in
+            guard let self, let target = self.completedSelection,
+                  case let .text(text, origin, color, size, name, weight, underline) = self.textShape(target) else { return }
+            self.setTextShape(.text(text, origin, color, min(max(size + delta * 0.35, 12), 80), name, weight, underline), target: target)
+            self.layoutCompletedHandle()
+            self.needsDisplay = true
+        }
+        textResizeHandle = handle
+        addSubview(handle)
+        layoutCompletedHandle()
+        needsDisplay = true
+    }
+
+    private func layoutCompletedHandle() {
+        guard let target = completedSelection, let shape = textShape(target) else { return }
+        let rect = shapeBounds(shape)
+        textResizeHandle?.frame = CGRect(x: rect.maxX - 8, y: rect.minY - 8, width: 14, height: 14)
+    }
+
+    private func cancelTextPress() {
+        textPressTimer?.invalidate()
+        textPressTimer = nil
+        pendingTextTarget = nil
+        pressPoint = nil
+        if completedDragActive { completedDragActive = false; endHistoryTransaction() }
+    }
+
+    private func clearCompletedSelection() {
+        guard completedSelection != nil else { return }
+        completedSelection = nil
+        textResizeHandle?.removeFromSuperview()
+        textResizeHandle = nil
+        needsDisplay = true
+    }
+
+    override func viewWillMove(toWindow newWindow: NSWindow?) {
+        if newWindow == nil { cancelTextPress(); clearCompletedSelection() }
+        super.viewWillMove(toWindow: newWindow)
+    }
+
     func moveSelectedText(by delta: CGSize) {
         guard let index = selectedTextIndex,
               case let .text(text, origin, color, size, name, weight, underline) = editableTexts[index] else { return }
         let next = clampedTextOrigin(CGPoint(x: origin.x + delta.width, y: origin.y + delta.height))
         editableTexts[index] = .text(text, next, color, size, name, weight, underline)
         layoutTextEditor()
+        recordHistory()
     }
 
     private func textAttributes(color: NSColor, size: CGFloat, name: String, weight: TextWeight, underline: Bool) -> [NSAttributedString.Key: Any] {

@@ -6,43 +6,35 @@ import XCTest
 final class ToolbarInteractionShadowTests: XCTestCase {
     @MainActor private final class ActionProbe: NSObject {
         var count = 0
-        @objc func invoke(_ sender: NSButton) {
+        @objc func invoke(_ sender: NSSegmentedControl) {
             count += 1
-            XCTAssertEqual(sender.state, .off)
-            XCTAssertFalse(sender.isHighlighted)
         }
     }
 
-    func testFourMomentaryActionsReleaseCancelRepeatAndKeyboard() throws {
+    func testFiveMomentaryActionsReleaseCancelRepeatAndKeyboard() throws {
         for mode in 0..<3 {
             let (controller, window, glass, canvas) = try editor(zoom: false)
             defer { _ = controller.perform(NSSelectorFromString("closeWindow")) }
             glass.forceFallback = mode == 1
             glass.updateAccessibility(reduceTransparency: mode == 2)
             let controls = descendants(glass)
-            let segments = try XCTUnwrap(controls.compactMap { $0 as? NSSegmentedControl }.first)
-            segments.selectedSegment = 3
-            try dispatch(segments)
-            let buttons = controls.compactMap { $0 as? GlassButton }
-            XCTAssertFalse(try XCTUnwrap(buttons.first { $0.toolTip == "关闭" }).usesMomentaryActionSurface)
-            for title in ["清空", "复制", "保存", "贴图"] {
+            let textButton = try XCTUnwrap(controls.compactMap { $0 as? NSSegmentedControl }.first)
+            textButton.selectedSegment = 3
+            try dispatch(textButton)
+            let buttons = controls.compactMap { $0 as? NSSegmentedControl }.filter { $0.trackingMode == .momentary }
+            XCTAssertEqual(buttons.count, 5)
+            for title in ["清空", "复制", "保存", "贴图", "关闭"] {
                 let button = try XCTUnwrap(buttons.first { $0.toolTip == title })
-                let cell = try XCTUnwrap(button.cell as? NSButtonCell)
-                XCTAssertTrue(button.usesMomentaryActionSurface)
-                XCTAssertEqual(cell.highlightsBy, [.pushInCellMask])
-                XCTAssertTrue(cell.showsStateBy.isEmpty)
+                let cell = try XCTUnwrap(button.cell as? NSSegmentedCell)
+                XCTAssertEqual(button.segmentStyle, textButton.segmentStyle)
                 let probe = ActionProbe()
                 button.target = probe
                 button.action = #selector(ActionProbe.invoke(_:))
-                button.setHovered(true)
                 _ = window.makeFirstResponder(button)
                 func assertIdle() {
-                    XCTAssertEqual(button.state, .off)
-                    XCTAssertEqual(cell.state, .off)
+                    XCTAssertEqual(button.selectedSegment, -1)
+                    XCTAssertFalse(button.isSelected(forSegment: 0))
                     XCTAssertFalse(cell.isHighlighted)
-                    XCTAssertEqual(button.feedbackLevel, 0)
-                    XCTAssertFalse(button.hasFeedbackAnimation)
-                    XCTAssertEqual(button.layer?.sublayers?.first { $0.name == "glassFeedbackSurface" }?.opacity, 0)
                     XCTAssertEqual(button.alphaValue, 1)
                 }
                 assertIdle()
@@ -59,18 +51,9 @@ final class ToolbarInteractionShadowTests: XCTestCase {
                     let down = event(.leftMouseDown, p)
                     let drag = event(.leftMouseDragged, end)
                     let up = event(.leftMouseUp, end)
-                    var observedPress = false
-                    let feedback = try XCTUnwrap(button.layer?.sublayers?.first { $0.name == "glassFeedbackSurface" })
-                    let observation = feedback.observe(\.opacity, options: [.new]) { _, change in
-                        MainActor.assumeIsolated {
-                            if change.newValue == 0.22 { observedPress = true }
-                        }
-                    }
                     NSApp.postEvent(up, atStart: true)
                     if cancel { NSApp.postEvent(drag, atStart: true) }
                     target.mouseDown(with: down)
-                    observation.invalidate()
-                    XCTAssertTrue(observedPress)
                     XCTAssertEqual(probe.count, before + (cancel ? 0 : 1))
                     assertIdle()
                 }
@@ -83,15 +66,14 @@ final class ToolbarInteractionShadowTests: XCTestCase {
                 button.performClick(nil)
                 XCTAssertEqual(probe.count, before + 2)
                 assertIdle()
-                XCTAssertEqual(segments.selectedSegment, 3)
+                XCTAssertEqual(textButton.selectedSegment, 3)
                 XCTAssertEqual(canvas.tool, .text)
             }
-            let shapes = try XCTUnwrap(controls.compactMap { $0 as? NSPopUpButton }.first)
-            shapes.selectItem(at: 2)
+            let shapes = try XCTUnwrap(controls.compactMap { $0 as? NSSegmentedControl }.first { $0.toolTip == "直线" })
             try dispatch(shapes)
-            for button in buttons where button.usesMomentaryActionSurface { button.performClick(nil) }
+            for button in buttons { button.performClick(nil) }
             XCTAssertEqual(canvas.tool, .line)
-            XCTAssertEqual(shapes.layer?.borderWidth, 2)
+            XCTAssertEqual(shapes.selectedSegment, 0)
         }
     }
 
@@ -150,11 +132,9 @@ final class ToolbarInteractionShadowTests: XCTestCase {
             defer { _ = controller.perform(NSSelectorFromString("closeWindow")) }
             glass.forceFallback = mode == 1
             glass.updateAccessibility(reduceTransparency: mode == 2)
-            let segments = try XCTUnwrap(descendants(glass).compactMap { $0 as? NSSegmentedControl }.first)
-            XCTAssertTrue(type(of: segments) == NSSegmentedControl.self)
-            XCTAssertTrue(type(of: segments.cell!) == NSSegmentedCell.self)
             for (index, tool) in [AnnotationTool.pen, .eraser, .mosaic, .text].enumerated() {
-                try mouseClick(segments, local: NSPoint(x: segments.bounds.width * (CGFloat(index) + 0.5) / 4, y: segments.bounds.midY))
+                let button = try XCTUnwrap(descendants(glass).compactMap { $0 as? NSSegmentedControl }.first)
+                try mouseClick(button, local: NSPoint(x: button.bounds.width * (CGFloat(index) + 0.5) / 4, y: button.bounds.midY))
                 XCTAssertEqual(canvas.tool, tool)
             }
             let panel = try XCTUnwrap(window.childWindows?.first { $0.title == "标注参数" })
@@ -175,7 +155,7 @@ final class ToolbarInteractionShadowTests: XCTestCase {
             controller.onPin = { _ in received.append("贴图") }
             controller.onClose = { received.append("关闭") }
             for title in ["清空", "复制", "保存", "贴图", "关闭"] {
-                let button = try XCTUnwrap(descendants(glass).compactMap { $0 as? NSButton }.first { $0.toolTip == title })
+                let button = try XCTUnwrap(descendants(glass).compactMap { $0 as? NSSegmentedControl }.first { $0.toolTip == title })
                 try mouseClick(button)
             }
             XCTAssertEqual(received, ["复制", "保存", "贴图", "关闭"])
@@ -195,6 +175,103 @@ final class ToolbarInteractionShadowTests: XCTestCase {
         let glass = try XCTUnwrap(descendants(root).compactMap { $0 as? GlassView }.first)
         let canvas = try XCTUnwrap(descendants(root).compactMap { $0 as? AnnotationCanvasView }.first)
         return (controller, window, glass, canvas)
+    }
+
+    func testRealEditorOutsideTextClickExitsNativeSelectionAndRequiresRearm() throws {
+        for zoom in [false, true] {
+            for mode in 0..<3 {
+                let (controller, window, glass, canvas) = try editor(zoom: zoom)
+                defer { _ = controller.perform(NSSelectorFromString("closeWindow")) }
+                glass.forceFallback = mode == 1
+                glass.updateAccessibility(reduceTransparency: mode == 2)
+                let segments = descendants(glass).compactMap { $0 as? NSSegmentedControl }
+                XCTAssertEqual(segments.count, 10, "左侧四段、四个形状和五个操作全部使用原生分段")
+                let tools = try XCTUnwrap(segments.first)
+                XCTAssertEqual(tools.segmentStyle, .separated)
+                XCTAssertEqual(tools.trackingMode, .selectOne)
+                XCTAssertEqual(tools.selectedSegment, -1)
+                for index in 0..<4 {
+                    XCTAssertEqual(tools.label(forSegment: index), "")
+                    XCTAssertNotNil(tools.image(forSegment: index))
+                }
+                XCTAssertEqual(tools.toolTip(forSegment: 3), "文字")
+                XCTAssertFalse(descendants(glass).compactMap { $0 as? NSButton }.contains {
+                    ["画笔", "橡皮", "马赛克", "文字", "格式"].contains($0.toolTip ?? "") || $0.title == "格式"
+                })
+                var revisions: [UInt64] = []
+                controller.onContentChange = { revisions.append($0) }
+                func select(_ index: Int) throws {
+                    try mouseClick(tools, local: NSPoint(x: tools.bounds.width * (CGFloat(index) + 0.5) / 4, y: tools.bounds.midY))
+                }
+                func canvasClick(_ point: CGPoint) throws {
+                    let target = try hit(canvas, local: point)
+                    let p = canvas.convert(point, to: nil)
+                    func event(_ type: NSEvent.EventType) -> NSEvent {
+                        NSEvent.mouseEvent(with: type, location: p, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                            windowNumber: window.windowNumber, context: nil, eventNumber: 1, clickCount: 1, pressure: type == .leftMouseUp ? 0 : 1)!
+                    }
+                    let up = event(.leftMouseUp)
+                    // 无工具时 AppKit 的窗口拖动可能消费 mouseUp；供原生循环读取。
+                    if canvas.tool == .none { NSApp.postEvent(up, atStart: true) }
+                    target.mouseDown(with: event(.leftMouseDown))
+                    target.mouseUp(with: up)
+                }
+                try select(0)
+                XCTAssertEqual(tools.selectedSegment, 0)
+                // 未选择文字前，画笔也必须接通自动复制通知。
+                let p = canvas.convert(CGPoint(x: 20, y: 20), to: nil)
+                for type in [NSEvent.EventType.leftMouseDown, .leftMouseDragged, .leftMouseUp] {
+                    let event = NSEvent.mouseEvent(with: type, location: CGPoint(x: p.x + (type == .leftMouseDown ? 0 : 30), y: p.y), modifierFlags: [], timestamp: 0,
+                        windowNumber: window.windowNumber, context: nil, eventNumber: 1, clickCount: 1, pressure: 1)!
+                    switch type {
+                    case .leftMouseDown: canvas.mouseDown(with: event)
+                    case .leftMouseDragged: canvas.mouseDragged(with: event)
+                    default: canvas.mouseUp(with: event)
+                    }
+                }
+                XCTAssertFalse(revisions.isEmpty)
+                canvas.clear()
+                try select(3)
+                XCTAssertEqual(canvas.tool, .text)
+                try canvasClick(CGPoint(x: 30, y: 250))
+                let input = try XCTUnwrap(canvas.subviews.compactMap { $0 as? NSTextView }.first)
+                XCTAssertTrue(window.firstResponder === input)
+                input.insertText("真实编辑器输入", replacementRange: NSRange(location: NSNotFound, length: 0))
+                let typedRevision = canvas.contentRevision
+                try canvasClick(CGPoint(x: 300, y: 50))
+                XCTAssertEqual(canvas.tool, .none)
+                XCTAssertEqual(tools.selectedSegment, -1)
+                XCTAssertFalse(canvas.textCreationArmed)
+                XCTAssertNil(canvas.selectedTextIndex)
+                XCTAssertTrue(canvas.subviews.isEmpty)
+                XCTAssertTrue(window.firstResponder === canvas)
+                XCTAssertTrue(window.childWindows?.isEmpty ?? true)
+                XCTAssertEqual(canvas.contentRevision, typedRevision, "状态退出不得重复自动复制")
+                XCTAssertEqual(canvas.shapes.count, 1)
+                try canvasClick(CGPoint(x: 300, y: 50))
+                XCTAssertTrue(canvas.subviews.isEmpty)
+                XCTAssertEqual(canvas.shapes.count, 1)
+                canvas.undoAnnotation()
+                XCTAssertTrue(canvas.shapes.isEmpty)
+                canvas.redoAnnotation()
+                XCTAssertEqual(canvas.shapes.count, 1)
+                XCTAssertEqual(tools.selectedSegment, -1)
+                try select(3)
+                try canvasClick(CGPoint(x: 200, y: 150))
+                XCTAssertNotNil(canvas.selectedTextIndex)
+                // 空输入外点也退出；已有文字不被删除。
+                try canvasClick(CGPoint(x: 300, y: 50))
+                XCTAssertEqual(tools.selectedSegment, -1)
+                XCTAssertEqual(canvas.shapes.count, 1)
+                let shape = try XCTUnwrap(descendants(glass).compactMap { $0 as? NSSegmentedControl }.first { $0.toolTip == "矩形" })
+                try mouseClick(shape)
+                XCTAssertEqual(shape.selectedSegment, 0)
+                XCTAssertEqual(tools.selectedSegment, -1)
+                try select(0)
+                XCTAssertEqual(tools.selectedSegment, 0)
+                XCTAssertEqual(shape.selectedSegment, -1)
+            }
+        }
     }
 
     func testActualToolbarAllActionsParametersAndShadowAcrossBackends() throws {
@@ -223,31 +300,52 @@ final class ToolbarInteractionShadowTests: XCTestCase {
                     XCTAssertEqual(glass.layer?.shadowRadius, 8)
                 }
                 let controls = descendants(glass.controlsHost).compactMap { $0 as? NSControl }.filter { $0.action != nil }
-                XCTAssertEqual(controls.count, 7) // segmented、形状和五个快捷按钮
+                XCTAssertEqual(controls.count, 10) // 全部为原生分段控件
+                XCTAssertEqual(controls.compactMap { $0 as? NSSegmentedControl }.count, 10)
+                for case let control as NSSegmentedControl in controls {
+                    XCTAssertEqual(control.segmentStyle, .separated)
+                    XCTAssertEqual(control.controlSize, .regular)
+                    for index in 0..<control.segmentCount {
+                        XCTAssertEqual(control.label(forSegment: index), "")
+                        XCTAssertNotNil(control.image(forSegment: index))
+                    }
+                }
+                let textIcon = try XCTUnwrap((controls.first as? NSSegmentedControl)?.image(forSegment: 3))
+                XCTAssertTrue(textIcon.isTemplate)
+                XCTAssertEqual(textIcon.accessibilityDescription, "文字 Aa")
+                let bitmap = try XCTUnwrap(NSBitmapImageRep(data: try XCTUnwrap(textIcon.tiffRepresentation)))
+                XCTAssertTrue((0..<bitmap.pixelsHigh).contains { y in
+                    (0..<bitmap.pixelsWide).contains { x in (bitmap.colorAt(x: x, y: y)?.alphaComponent ?? 0) > 0 }
+                }, "Aa 必须有真实非透明像素")
+                let group = controls.reduce(CGRect.null) { $0.union($1.convert($1.bounds, to: glass)) }
+                XCTAssertEqual(group.midX, glass.bounds.midX, accuracy: 0.5)
+                XCTAssertTrue(glass.bounds.contains(group))
+                XCTAssertEqual(glass.bounds.width, 600)
+                XCTAssertGreaterThanOrEqual(group.minX, 27)
+                XCTAssertGreaterThanOrEqual(glass.bounds.maxX - group.maxX, 27)
+                if let screen = window.screen { XCTAssertTrue(screen.visibleFrame.contains(window.frame)) }
                 for control in controls { try hit(control) }
-                let segments = try XCTUnwrap(controls.compactMap { $0 as? NSSegmentedControl }.first)
-                let shapes = try XCTUnwrap(controls.compactMap { $0 as? NSPopUpButton }.first)
                 for (index, tool) in [AnnotationTool.pen, .eraser, .mosaic, .text].enumerated() {
-                    try hit(segments, local: NSPoint(x: segments.bounds.width * (CGFloat(index) + 0.5) / 4, y: segments.bounds.midY))
-                    segments.selectedSegment = index
-                    try dispatch(segments)
+                    let button = try XCTUnwrap(controls.compactMap { $0 as? NSSegmentedControl }.first)
+                    button.selectedSegment = index
+                    try dispatch(button)
                     XCTAssertEqual(canvas.tool, tool)
                     if index == 0 || index == 3 {
                         try checkParameters(window: window, canvas: canvas, mode: mode, text: index == 3)
                     } else { XCTAssertTrue(window.childWindows?.isEmpty ?? true) }
-                    try dispatch(segments)
-                    XCTAssertEqual(canvas.tool, .none)
+                    try dispatch(button)
+                    XCTAssertEqual(canvas.tool, tool == .text ? .text : .none)
                 }
-                for (index, tool) in [AnnotationTool.rectangle, .oval, .line, .arrow].enumerated() {
-                    shapes.selectItem(at: index)
-                    try dispatch(shapes)
+                for tool in [AnnotationTool.rectangle, .oval, .line, .arrow] {
+                    let shapes = try XCTUnwrap(controls.compactMap { $0 as? NSSegmentedControl }.first { $0.toolTip == tool.rawValue })
+                    try mouseClick(shapes)
                     XCTAssertEqual(canvas.tool, tool)
-                    XCTAssertEqual(segments.selectedSegment, -1)
-                    XCTAssertEqual(shapes.layer?.borderWidth, 2)
+                    XCTAssertEqual(controls.compactMap { $0 as? NSSegmentedControl }.filter { $0.selectedSegment >= 0 }.count, 1)
+                    XCTAssertEqual(shapes.selectedSegment, 0)
                     try checkParameters(window: window, canvas: canvas, mode: mode, text: false)
-                    try dispatch(shapes)
+                    try mouseClick(shapes)
                     XCTAssertEqual(canvas.tool, .none)
-                    XCTAssertEqual(shapes.layer?.borderWidth, 0)
+                    XCTAssertEqual(shapes.selectedSegment, -1)
                 }
                 var copied = 0, saved = 0, pinned = 0, closed = 0
                 controller.onCopy = { _ in copied += 1 }
@@ -255,7 +353,7 @@ final class ToolbarInteractionShadowTests: XCTestCase {
                 controller.onPin = { _ in pinned += 1 }
                 controller.onClose = { closed += 1 }
                 for title in ["清空", "复制", "保存", "贴图", "关闭"] {
-                    let button = try XCTUnwrap(controls.compactMap { $0 as? NSButton }.first { $0.toolTip == title })
+                    let button = try XCTUnwrap(controls.compactMap { $0 as? NSSegmentedControl }.first { $0.toolTip == title })
                     try dispatch(button)
                 }
                 XCTAssertTrue(canvas.shapes.isEmpty)

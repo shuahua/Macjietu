@@ -3,10 +3,11 @@ import AppKit
 @MainActor
 final class LongScreenshotProgressOverlayController {
     var onDoubleClickSelection: (() -> Void)?
+    var onAutomaticToggle: (() -> Void)?
 
     private let borderWindow: NSWindow
     private let thumbnailWindow: NSWindow
-    private let thumbnailView = LongScreenshotThumbnailView(frame: CGRect(x: 0, y: 0, width: 220, height: 180))
+    private let thumbnailView = LongScreenshotThumbnailView(frame: CGRect(x: 0, y: 0, width: 248, height: 180))
     private let selectionRect: CGRect
     private var avoidedFrame: CGRect?
     private var isThumbnailVisible = false
@@ -14,6 +15,7 @@ final class LongScreenshotProgressOverlayController {
     private var isCaptureHidden = false
     private var isClosed = false
     private(set) var previewImage: NSImage?
+    private let automaticButton = GlassButton(title: "自动滚动", target: nil, action: nil)
     private let finishButton = GlassButton(title: "完成长截图", target: nil, action: nil)
     var captureWindowIDs: Set<CGWindowID> {
         Set([borderWindow, thumbnailWindow].filter { $0.windowNumber > 0 }.map { CGWindowID($0.windowNumber) })
@@ -24,6 +26,16 @@ final class LongScreenshotProgressOverlayController {
         thumbnailView.needsDisplay = true
     }
 
+    func setAutomaticScrollState(isRunning: Bool, available: Bool) {
+        automaticButton.title = isRunning ? "暂停自动" : "自动滚动"
+        automaticButton.isEnabled = isRunning || available
+        automaticButton.toolTip = available ? "切换自动滚动；暂停后可手动调整" : "自动滚动需要辅助功能权限"
+        thumbnailView.automaticScrollRunning = isRunning
+        thumbnailView.automaticScrollAvailable = available
+        thumbnailView.needsDisplay = true
+    }
+
+    @objc private func automaticClicked() { onAutomaticToggle?() }
     @objc private func finishClicked() { onDoubleClickSelection?() }
 
     init(selectionRect: CGRect) {
@@ -47,7 +59,7 @@ final class LongScreenshotProgressOverlayController {
         borderWindow.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
 
         thumbnailWindow = NSWindow(
-            contentRect: CGRect(x: 0, y: 0, width: 220, height: 180),
+            contentRect: CGRect(x: 0, y: 0, width: 248, height: 180),
             styleMask: [.borderless],
             backing: .buffered,
             defer: false
@@ -64,9 +76,13 @@ final class LongScreenshotProgressOverlayController {
         thumbnailWindow.isReleasedWhenClosed = false
         thumbnailWindow.hasShadow = true
         thumbnailWindow.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        automaticButton.target = self
+        automaticButton.action = #selector(automaticClicked)
+        automaticButton.frame = CGRect(x: 8, y: 4, width: 108, height: 24)
+        glass.addSubview(automaticButton)
         finishButton.target = self
         finishButton.action = #selector(finishClicked)
-        finishButton.frame = CGRect(x: 50, y: 4, width: 120, height: 28)
+        finishButton.frame = CGRect(x: 128, y: 4, width: 112, height: 24)
         glass.addSubview(finishButton)
 
         borderView.onDoubleClick = { [weak self] in self?.onDoubleClickSelection?() }
@@ -119,6 +135,7 @@ final class LongScreenshotProgressOverlayController {
         guard !isClosed else { return }
         isClosed = true
         onDoubleClickSelection = nil
+        onAutomaticToggle = nil
         stopDoubleClickMonitor()
         borderWindow.orderOut(nil)
         thumbnailWindow.orderOut(nil)
@@ -129,7 +146,7 @@ final class LongScreenshotProgressOverlayController {
     }
 
     private func thumbnailSize(for image: NSImage) -> CGSize {
-        let width: CGFloat = 220
+        let width: CGFloat = 248
         let imageWidth = max(image.size.width, 1)
         let imageHeight = max(image.size.height, 1)
         let height = min(max(width * imageHeight / imageWidth, 140), 420)
@@ -244,6 +261,8 @@ private final class LongScreenshotSelectionBorderView: NSView {
 
 private final class LongScreenshotThumbnailView: NSView {
     var statusText: String?
+    var automaticScrollRunning = false
+    var automaticScrollAvailable = false
     private var image: NSImage?
     private var frameCount = 0
 
@@ -266,7 +285,17 @@ private final class LongScreenshotThumbnailView: NSView {
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
 
-        let text = statusText ?? (frameCount == 0 ? "等待截取第一段" : "已截取 \(frameCount) 段；可按 Esc 完成")
+        let defaultText: String
+        if frameCount == 0 {
+            defaultText = "正在捕获首帧…"
+        } else if automaticScrollRunning {
+            defaultText = "自动滚动中 · 已拼接 \(frameCount) 段"
+        } else if automaticScrollAvailable {
+            defaultText = "已拼接 \(frameCount) 段 · 可自动或手动滚动"
+        } else {
+            defaultText = "已拼接 \(frameCount) 段 · 手动慢滚更稳"
+        }
+        let text = statusText ?? defaultText
         let labelHeight: CGFloat = 68
         let imageRect = CGRect(
             x: 10,

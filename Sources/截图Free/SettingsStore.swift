@@ -20,11 +20,13 @@ enum ScreenshotExportScale: Double, CaseIterable {
 struct AppSettings: Codable, Equatable {
     var captureShortcut: Shortcut
     var autoCopyAfterCapture: Bool
+    var screenshotShelfEnabled = true
     var launchAtLogin: Bool
     var saveDirectory: URL?
     var exportScale: Double
     // 缺少整个字典才是旧格式；字典中缺项表示明确清除，不补默认。
     var shortcuts: [String: Shortcut]? = nil
+    var shortcutSchemaVersion = 2
 
     func shortcut(for action: ShortcutAction) -> Shortcut? {
         if let shortcuts { return shortcuts[action.rawValue] }
@@ -61,7 +63,14 @@ struct AppSettings: Codable, Equatable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         captureShortcut = try container.decode(Shortcut.self, forKey: .captureShortcut)
         shortcuts = try container.decodeIfPresent([String: Shortcut].self, forKey: .shortcuts)
+        let version = try container.decodeIfPresent(Int.self, forKey: .shortcutSchemaVersion) ?? 1
+        if version < 2, shortcuts != nil, shortcuts?["shelf"] == nil,
+           let proposed = ShortcutAction.shelf.legacyDefault,
+           shortcuts?.values.contains(proposed) == false {
+            shortcuts?["shelf"] = proposed
+        }
         autoCopyAfterCapture = try container.decode(Bool.self, forKey: .autoCopyAfterCapture)
+        screenshotShelfEnabled = try container.decodeIfPresent(Bool.self, forKey: .screenshotShelfEnabled) ?? true
         launchAtLogin = try container.decodeIfPresent(Bool.self, forKey: .launchAtLogin) ?? Self.defaults.launchAtLogin
         saveDirectory = try container.decodeIfPresent(URL.self, forKey: .saveDirectory)
         // 保留旧 1/2/3 的选择，已移除的 4/5 收敛到 3；缺失字段推荐原始。
@@ -71,6 +80,7 @@ struct AppSettings: Codable, Equatable {
 }
 
 final class SettingsStore {
+    static let didSave = Notification.Name("SettingsStore.didSave")
     private let fileURL: URL
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
@@ -92,5 +102,6 @@ final class SettingsStore {
         try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         let data = try encoder.encode(settings)
         try data.write(to: fileURL, options: .atomic)
+        NotificationCenter.default.post(name: Self.didSave, object: self, userInfo: ["settings": settings])
     }
 }
